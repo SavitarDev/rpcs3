@@ -172,6 +172,14 @@ void usb_device_passthrough::send_libusb_transfer(libusb_transfer* transfer)
 
 bool usb_device_passthrough::open_device()
 {
+	// The handle can still be open if a guest driver gave up and its LDD got re-registered
+	// (disconnect_usb_device does not close passthrough handles). Reuse it instead of asking
+	// libusb to open the device a second time, which fails with ACCESS_DENIED on Windows/WinUSB.
+	if (lusb_handle)
+	{
+		return true;
+	}
+
 	if (libusb_open(lusb_device, &lusb_handle) == LIBUSB_SUCCESS)
 	{
 #ifdef __linux__

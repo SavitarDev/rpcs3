@@ -1,12 +1,15 @@
 #include "stdafx.h"
 #include "sys_ss.h"
+#include "sys_ss_magicgate.h"
 
 #include "sys_process.h"
 #include "Emu/IdManager.h"
+#include "Emu/Memory/vm.h"
 #include "Emu/Cell/timers.hpp"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/system_config.h"
 #include "util/sysinfo.hpp"
+#include "Utilities/StrUtil.h"
 
 #include <charconv>
 #include <shared_mutex>
@@ -582,6 +585,98 @@ error_code sys_ss_individual_info_manager(u64 pkg_id, u64 a2, vm::ptr<u64> out_s
 	// Get EID size
 	case 0x17001: *out_size = 0x100; break;
 	default: break;
+	}
+
+	return CELL_OK;
+}
+
+// sys_ss_sec_hw_framework: lv2 gateway to lv1's "Security Hardware Framework" (storage_manager_if).
+// Only r3 (packet id) and r4 (pointer to a packet-specific parameter block) are set by callers;
+// r5..r10 are left uninitialised, so this HLE ignores a2..a7.
+//
+// Packet 0x5008 ("HW mc") is the MagicGate/MechaCon authentication that lv1 normally forwards to the
+// isolated SPU module sb_iso_spu_module.self. libmcadpt.sprx (the XMB "Memory Card Utility (PS/PS2)")
+// calls it, via two wrappers in that module:
+//
+//   sub-command 1 (block[0]==1): in  block[0x08]=CardIV, block[0x10]=CardMaterial, block[0x18]=CardNonce
+//                                out block[0x20]=MechaChallenge1, block[0x28]=2, block[0x30]=3
+//   sub-command 2 (block[0]==2): in  block[0x08..0x20] = CardResponse1..3   (verify + latch session key)
+//
+// The crypto is handled by magicgate:: using user-supplied retail keys (<config>/MagicGate.bin).
+error_code sys_ss_sec_hw_framework(ppu_thread& ppu, u64 pkg_id, u64 a1, u64 /*a2*/, u64 /*a3*/, u64 /*a4*/, u64 /*a5*/, u64 /*a6*/, u64 /*a7*/)
+{
+	(void)ppu;
+
+	sys_ss.trace("sys_ss_sec_hw_framework(pkg_id=0x%llx, param_block=*0x%llx)", pkg_id, a1);
+
+	switch (pkg_id)
+	{
+	case 0x5008:
+	{
+		const u32 block = static_cast<u32>(a1);
+
+		if (a1 > u64{u32{umax}} || !block || !vm::check_addr(block, vm::page_readable | vm::page_writable, 0x38))
+		{
+			sys_ss.error("sys_ss_sec_hw_framework(0x5008): bad parameter block pointer 0x%llx", a1);
+			return CELL_EFAULT;
+		}
+
+		u8* const p = static_cast<u8*>(vm::base(block));
+
+		u64 subcmd = 0;
+		for (int i = 0; i < 8; i++)
+			subcmd = (subcmd << 8) | p[i];
+
+		if (subcmd == 1)
+		{
+			const magicgate::mc_auth_result r = magicgate::mc_auth_generate_challenge(
+				p + 0x08, p + 0x10, p + 0x18, p + 0x20, p + 0x28, p + 0x30);
+
+			if (r == magicgate::mc_auth_result::no_keys)
+			{
+				// Keep the historical behaviour visible: without keys, PS2 cards can't work.
+				std::memset(p + 0x20, 0, 0x18);
+				return CELL_ENOSYS;
+			}
+			if (r != magicgate::mc_auth_result::ok)
+			{
+				sys_ss.error("sys_ss_sec_hw_framework(0x5008/1): challenge generation failed (%d)", static_cast<int>(r));
+				return CELL_EINVAL;
+			}
+
+			sys_ss.notice("sys_ss_sec_hw_framework(0x5008/1): MagicGate challenge generated");
+			return CELL_OK;
+		}
+
+		if (subcmd == 2)
+		{
+			const magicgate::mc_auth_result r = magicgate::mc_auth_verify_response(p + 0x08, p + 0x10, p + 0x18);
+
+			if (r == magicgate::mc_auth_result::no_keys)
+				return CELL_ENOSYS;
+			if (r != magicgate::mc_auth_result::ok)
+			{
+				sys_ss.error("sys_ss_sec_hw_framework(0x5008/2): card response verification failed (%d)", static_cast<int>(r));
+				return CELL_EINVAL;
+			}
+
+			sys_ss.notice("sys_ss_sec_hw_framework(0x5008/2): MagicGate authentication OK");
+			return CELL_OK;
+		}
+
+		sys_ss.todo("sys_ss_sec_hw_framework(0x5008): unhandled sub-command %d", subcmd);
+		return CELL_OK;
+	}
+	// "HW me auth header" / "HW me dec block" - related media-engine crypto services, unemulated.
+	case 0x5009:
+	case 0x500a:
+	{
+		sys_ss.error("sys_ss_sec_hw_framework(0x%x): unsupported secure hardware crypto service.", pkg_id);
+		return CELL_ENOSYS;
+	}
+	default:
+		sys_ss.todo("sys_ss_sec_hw_framework(): unhandled packet id 0x%x", pkg_id);
+		break;
 	}
 
 	return CELL_OK;

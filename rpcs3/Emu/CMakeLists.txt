@@ -238,6 +238,7 @@ target_sources(rpcs3_emu PRIVATE
     Cell/lv2/sys_spu.cpp
     Cell/lv2/sys_sm.cpp
     Cell/lv2/sys_ss.cpp
+    Cell/lv2/sys_ss_magicgate.cpp
     Cell/lv2/sys_storage.cpp
     Cell/lv2/sys_time.cpp
     Cell/lv2/sys_timer.cpp

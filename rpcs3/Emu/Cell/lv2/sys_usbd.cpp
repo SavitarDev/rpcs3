@@ -266,6 +266,11 @@ private:
 		{0x054C, 0x01CB, 0x01CB, "PSP Type D", nullptr, nullptr}, // UsbPspCm
 		{0x054C, 0x02D2, 0x02D2, "PSP Slim", nullptr, nullptr},
 
+		// Sony PS3 Memory Card Adaptor (CECH-ZM1 / SCPH-98042) - reads physical PS1/PS2 memory cards.
+		// Vendor specific class (0xFF), single interface, bulk EP 0x02 OUT / 0x81 IN (64 bytes) + interrupt EP 0x83 IN.
+		// Passthrough only: the guest driver must claim it via sys_usbd_register_extra_ldd (VID/PID).
+		{0x054C, 0x02EA, 0x02EA, "Memory Card Adaptor", nullptr, nullptr},
+
 		// 0x0900: "H050 USJ(C) PCB rev00", 0x0910: "USIO PCB rev00"
 		{0x0B9A, 0x0900, 0x0910, "PS3A-USJ", &usb_device_usio::get_num_emu_devices, &usb_device_usio::make_instance},
 
@@ -1289,7 +1294,8 @@ error_code sys_usbd_get_descriptor(ppu_thread& ppu, u32 handle, u32 device_handl
 	return CELL_OK;
 }
 
-// This function is used for psp(cellUsbPspcm), ps3 arcade usj io(PS3A-USJ), ps2 cam(eyetoy), generic usb camera?(sample_usb2cam)
+// This function is used for psp(cellUsbPspcm), ps3 arcade usj io(PS3A-USJ), ps2 cam(eyetoy), generic usb camera?(sample_usb2cam),
+// and the PS1/PS2 Memory Card Adaptor (McAdapter, CECHZM1/SCPH-98042) used by the VSH "Memory Card Utility (PS/PS2)".
 error_code sys_usbd_register_ldd(ppu_thread& ppu, u32 handle, vm::cptr<char> s_product, u16 slen_product)
 {
 	ppu.state += cpu_flag::wait;
@@ -1303,7 +1309,8 @@ error_code sys_usbd_register_ldd(ppu_thread& ppu, u32 handle, vm::cptr<char> s_p
 	{
 		{"cellUsbPspcm", {0x054C, 0x01CB, 0x01CB}},
 		{"guncon3", {0x0B9A, 0x0800, 0x0800}},
-		{"PS3A-USJ", {0x0B9A, 0x0900, 0x0910}}
+		{"PS3A-USJ", {0x0B9A, 0x0900, 0x0910}},
+		{"McAdapter", {0x054C, 0x02EA, 0x02EA}}
 	};
 
 	if (const auto iterator = predefined_ldds.find(product); iterator != predefined_ldds.end())

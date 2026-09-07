@@ -816,6 +816,9 @@
     <ClCompile Include="Emu\Cell\lv2\sys_ss.cpp">
       <Filter>Emu\Cell\lv2</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\Cell\lv2\sys_ss_magicgate.cpp">
+      <Filter>Emu\Cell\lv2</Filter>
+    </ClCompile>
     <ClCompile Include="util\sysinfo.cpp">
       <Filter>Utilities</Filter>
     </ClCompile>
@@ -2086,6 +2089,9 @@
       <Filter>Utilities</Filter>
     </ClInclude>
     <ClInclude Include="Emu\Cell\lv2\sys_ss.h">
+      <Filter>Emu\Cell\lv2</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\Cell\lv2\sys_ss_magicgate.h">
       <Filter>Emu\Cell\lv2</Filter>
     </ClInclude>
     <ClInclude Include="..\Utilities\CRC.h">
