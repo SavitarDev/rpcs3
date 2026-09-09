@@ -467,7 +467,7 @@ const std::array<std::pair<ppu_intrp_func_t, std::string_view>, 1024> g_ppu_sysc
 	NULL_FUNC(sys_sm_request_error_log),                    //390 (0x186)  ROOT
 	NULL_FUNC(sys_sm_request_be_count),                     //391 (0x187)  ROOT
 	BIND_SYSC(sys_sm_ring_buzzer),                          //392 (0x188)  ROOT
-	NULL_FUNC(sys_sm_get_hw_config),                        //393 (0x189)  ROOT
+	BIND_SYSC(sys_sm_get_hw_config),                        //393 (0x189)  ROOT
 	NULL_FUNC(sys_sm_request_scversion),                    //394 (0x18A)  ROOT
 	NULL_FUNC(sys_sm_request_system_event_log),             //395 (0x18B)  PM
 	NULL_FUNC(sys_sm_set_rtc_alarm),                        //396 (0x18C)  ROOT
@@ -846,7 +846,7 @@ const std::array<std::pair<ppu_intrp_func_t, std::string_view>, 1024> g_ppu_sysc
 	BIND_SYSC(sys_ss_get_cache_of_product_mode),            //873 (0x369)
 	BIND_SYSC(sys_ss_get_cache_of_flash_ext_flag),          //874 (0x36A)
 	BIND_SYSC(sys_ss_get_boot_device),                      //875 (0x36B)
-	NULL_FUNC(sys_ss_disc_access_control),                  //876 (0x36C)
+	BIND_SYSC(sys_ss_disc_access_control),                  //876 (0x36C)
 	null_func, //BIND_SYSC(sys_ss_~utoken_if),              //877 (0x36D)  ROOT
 	NULL_FUNC(sys_ss_ad_sign),                              //878 (0x36E)
 	NULL_FUNC(sys_ss_media_id),                             //879 (0x36F)

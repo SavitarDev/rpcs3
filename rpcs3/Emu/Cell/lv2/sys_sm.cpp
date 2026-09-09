@@ -22,6 +22,43 @@ error_code sys_sm_get_params(vm::ptr<u8> a, vm::ptr<u8> b, vm::ptr<u32> c, vm::p
 	return CELL_OK;
 }
 
+error_code sys_sm_get_hw_config(vm::ptr<u8> unk, vm::ptr<u64> model)
+{
+	sys_sm.warning("sys_sm_get_hw_config(unk=*0x%x, model=*0x%x)", unk, model);
+
+	if (!unk || !model)
+	{
+		return CELL_EFAULT;
+	}
+
+	// The second output is the console's hardware configuration word: the VSH asks for it at
+	// vsh.elf 0x251810 and sends it to Sony's netstart service verbatim, formatted as
+	// "&model=%016llx" at 0x25182c. The bits below are the ones the firmware is known to test:
+	//
+	//   0x0000000000000010  optical drive present                 vsh.elf 0x44e808
+	//   0x0000000000000100  PlayStation 2 hardware compatibility  explore_plugin 0xdddb0
+	//   0x2000000000000000  PlayStation 2 software emulation      explore_plugin 0xdddc0
+	//
+	// vsh.elf 0x44e808 reads bit 0x10 and skips querying the optical drive entirely when it is
+	// clear. explore_plugin tests the two PS2 bits in turn and, with neither of them set, writes
+	// reason 9 into the item at +0x2c4 (0xdddd0), which is what the XMB draws as unsupported data
+	// and what puts up "This model of the PS3 system is not compatible with PlayStation 2 format
+	// software"; game_ext_plugin reads the same pair at 0x16fe4 to pick the hardware emulator over
+	// the software one. Leaving the word at zero, which is what this syscall being unimplemented
+	// amounted to, says the console has neither a drive nor PS2 support.
+	//
+	// This describes the machine, not the medium, so it does not follow what is in the tray: it
+	// answers for the same console sys_ss_appliance_info_manager reports, a launch COK-001 with
+	// the PlayStation 2 hardware on board and an optical drive attached.
+	constexpr u64 hw_optical_drive = 0x0000000000000010;
+	constexpr u64 hw_ps2_hardware  = 0x0000000000000100;
+
+	*unk = 0;
+	*model = hw_optical_drive | hw_ps2_hardware;
+
+	return CELL_OK;
+}
+
 error_code sys_sm_get_ext_event2(vm::ptr<u64> a1, vm::ptr<u64> a2, vm::ptr<u64> a3, u64 a4)
 {
 	sys_sm.trace("sys_sm_get_ext_event2(a1=*0x%x, a2=*0x%x, a3=*0x%x, a4=*0x%x, a4=0x%xll", a1, a2, a3, a4);

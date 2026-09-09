@@ -26,6 +26,10 @@ namespace
 		storage_manager_impl(const storage_manager_impl&) = delete;
 		int operator=(const storage_manager_impl&) = delete;
 
+		// Set once the guest has re-registered its medium event port against an opened drive
+		// handle, which is the point at which it can actually service a medium event.
+		atomic_t<bool> drive_ready = false;
+
 		void send_event(u64 device_id, u64 data1, u64 data2, u64 data3)
 		{
 			id_manager::g_process = 0;
@@ -51,63 +55,71 @@ namespace
 			}
 		}
 
-		void operator()() noexcept
+		void announce_medium()
 		{
-			u32 events[] =
+			// Eladash's original sequence, minus the 0x101 wake-up that is sent separately at startup.
+			//
+			// The pauses are what space the sequence out for the firmware, and an aborting thread
+			// returns from them at once, so the abort has to be tested between the events as well:
+			// without that the whole sequence fires back to back into a guest that is being torn down.
+			constexpr u64 events[][2] =
 			{
-				// First class
-				//3,
-				// 4,
-				 7,
-				// 8,
-
-				// 0x101,
-				// 0x102,
+				{0x000000000000ff71, 0x0101000000000006},
+				{0, 0x0101000000000004},
+				{0, 0x0101000000000008},
+				{0x000000000000ff71, 0x0101000000000003},
 			};
 
-			//u64 start_time = get_system_time();
-			u64 start_count = 0;
-			u64 event_index = 0;
+			for (const auto& event : events)
+			{
+				if (thread_ctrl::state() == thread_state::aborting)
+				{
+					return;
+				}
 
+				send_event(0x0101000000000006, 0x0000000000000003, event[0], event[1]);
+				thread_ctrl::wait_for(2500000);
+			}
+		}
+
+		void operator()() noexcept
+		{
 			while (Emu.IsPausedOrReady())
 			{
 				thread_ctrl::wait_for(2500);
 			}
 
-			for (u32 ii = 0; ii < 10; ii++)
+			// Give the VSH a moment to reach the point where x3::_BDInitialize has registered its
+			// bootstrap medium event port, otherwise the wake-up below reaches nobody.
+			for (u32 i = 0; i < 5 && thread_ctrl::state() != thread_state::aborting; i++)
 			{
 				thread_ctrl::wait_for(1000 * 1000);
 			}
 
-			while (thread_ctrl::state() != thread_state::aborting)
+			// The first event of the sequence is the wake-up: it is what makes x3::_PollingService
+			// open the drive and re-register its medium event port against a real storage handle.
+			// Only after that does x3::_MediaDetect have a usable drive object, so wait for the
+			// re-registration before announcing anything about the medium itself.
+			send_event(0x0101000000000006, 0x0000000000000101, 0x0000000000000000, 0x0101000000000006);
+
+			for (u32 i = 0; i < 30 * 1000 / 25 && !drive_ready && thread_ctrl::state() != thread_state::aborting; i++)
 			{
 				thread_ctrl::wait_for(25000);
-
-				start_count++;
-
-				if (start_count == 1)
-				{
-					sys_storage.notice("storage_manager(): Sending 0x%x (Media ID = 0x%x)", events[event_index], start_count);
-
-
-					if (true)
-					{
-						send_event(0x0101000000000006, 0x0000000000000101, 0x0000000000000000, 0x0101000000000006);
-						thread_ctrl::wait_for(2500000);
-
-						send_event(0x0101000000000006, 0x0000000000000003, 0x000000000000ff71, 0x0101000000000006);
-						thread_ctrl::wait_for(2500000);
-
-						send_event(0x0101000000000006, 0x0000000000000003, 0, 0x0101000000000004);
-						thread_ctrl::wait_for(2500000);
-						send_event(0x0101000000000006, 0x0000000000000003, 0, 0x0101000000000008);
-						thread_ctrl::wait_for(2500000);
-						send_event(0x0101000000000006, 0x0000000000000003, 0x000000000000ff71, 0x0101000000000003);
-						thread_ctrl::wait_for(2500000);
-					}
-
-				}
 			}
+
+			if (drive_ready)
+			{
+				sys_storage.notice("storage_manager(): the guest opened the optical drive, announcing the medium");
+			}
+			else
+			{
+				sys_storage.warning("storage_manager(): the guest never opened the optical drive, announcing the medium anyway");
+			}
+
+			// Let the drive setup that follows that registration settle.
+			thread_ctrl::wait_for(2500000);
+
+			announce_medium();
 		}
 
 		static constexpr auto thread_name = "VSH Storage Events"sv;
@@ -491,7 +503,11 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 		{
 			if (info.response_base.size() != outlen)
 			{
-				fmt::throw_exception("Misidentification of input data type! ID=x%d (response size: %d)", info.ID, info.response_base.size());
+				// A known opcode issued with an unexpected allocation length. Answer with an empty
+				// buffer instead of aborting the emulator: non-PS3 media make the VSH use command
+				// variants that the reverse engineered PS3 BD-ROM table does not cover.
+				sys_storage.warning("sys_storage_async_send_device_command(): command ID=%d expects a 0x%x byte response, guest asked for 0x%x", info.ID, info.response_base.size(), outlen);
+				continue;
 			}
 
 			found_ID = info.ID;
@@ -852,8 +868,41 @@ error_code sys_storage_configure_medium_event(ppu_thread& ppu, u32 fd, u32 equeu
 
 	auto& manager = *ensure(g_fxo->try_get<storage_manager>());
 
+	if (device_id)
+	{
+		// The VSH registers twice: once from x3::_BDInitialize with fd 0, before it has opened the
+		// drive, and again from x3::_PollingService with a real storage handle once the drive is
+		// up. Only after the second one does x3::_MediaDetect have a usable drive object - firing
+		// a medium event before that makes it run a method on a null object and crash.
+		manager.drive_ready = true;
+	}
+
 	if (auto queue = idm::get_unlocked<lv2_obj, lv2_event_queue>(equeue_id))
 	{
+		// A configured event queue carries a single registration. The VSH configures the medium
+		// event twice on the same queue - once from x3::_BDInitialize with fd 0, before the drive
+		// is open, and again from x3::_PollingService with a real storage handle (vsh.elf 0x516ca4,
+		// reached from 0x51850c and 0x518570) - and hands the same output address to both calls, so
+		// it only ever remembers one handle. Keeping the earlier registration alive would deliver
+		// every medium event to that queue twice, and the VSH answers a medium event by spawning an
+		// x3::_MediaDetect thread: the second thread then races the first over the same drive, its
+		// sys_fs_mount of /dev_bdvd fails with EBUSY, and the VSH takes the mount failure path that
+		// publishes an unsupported medium (vsh.elf 0x518ef0).
+		std::vector<u32> superseded;
+
+		idm::select<lv2_storage_medium_event_port>([&](u32 id, lv2_storage_medium_event_port& port)
+		{
+			if (port.medium_port.get() == queue.get())
+			{
+				superseded.emplace_back(id);
+			}
+		});
+
+		for (u32 id : superseded)
+		{
+			idm::remove<lv2_storage_medium_event_port>(id);
+		}
+
 		while (!idm::make_ptr<lv2_storage_medium_event_port>(device_id, queue))
 		{
 			std::vector<std::pair<u32, u32>> cleanup_list;

@@ -248,7 +248,12 @@ error_code sys_ss_appliance_info_manager(u32 code, vm::ptr<u8> buffer)
 	case 0x19003:
 	{
 		// AIM_get_device_id
-		constexpr u8 idps[] = { 0x00, 0x00, 0x00, 0x01, 0x00, 0x89, 0x00, 0x0B, 0x14, 0x00, 0xEF, 0xDD, 0xCA, 0x25, 0x52, 0x66 };
+		// Bytes 6-7 are the IDPS product code, the model the firmware believes it runs on. A
+		// console does not change model, so this cannot follow what is in the drive: report
+		// COK-001 (0x0001), the launch CECHA, which is the model carrying the PlayStation 2
+		// hardware. The VSH refuses every PS1/PS2 disc without it. The stock value here was
+		// 0x000B, JSD-001, a slim with no backwards compatibility.
+		constexpr u8 idps[] = { 0x00, 0x00, 0x00, 0x01, 0x00, 0x89, 0x00, 0x01, 0x14, 0x00, 0xEF, 0xDD, 0xCA, 0x25, 0x52, 0x66 };
 		std::memcpy(buffer.get_ptr(), idps, 16);
 		if (g_cfg.core.debug_console_mode)
 		{
@@ -570,10 +575,29 @@ error_code sys_ss_sec_hw_framework(ppu_thread& ppu, u64 pkg_id, u64 a1)
 
 	switch (pkg_id)
 	{
-	case 0x5004: return CELL_OK;
+	case 0x5004:
+	{
+		// Authenticate BD Drive. Here the service parameter is passed directly in a1: 0x29 resets
+		// the drive and clears the key, 0x46 authenticates it, 0x52 is the PS2 disc insert policy
+		// check (cellSsDrvPs2DiscInsert). Log it so the PS2 path can be recognized in traces.
+		sys_ss.notice("sys_ss_sec_hw_framework(0x5004): service 0x%llx", a1);
+		return CELL_OK;
+	}
 	case 0x5007:
 	{
-		sys_ss.todo("sys_ss_sec_hw_framework(0x5007): input: %s", std::span<u8>(ppu._sudo<u8>(a1), 0x18));
+		// Control BD Drive. a1 points at a request block whose byte 7 selects the service:
+		// 0x3F disc id + auth + get profile, 0x43 disc change (cellSsDrvAuthDiscChange),
+		// 0x46 get disc hash key (cellSsDrvGetDiscId), 0x53 disc insert (cellSsDrvPs3DiscInsert).
+		// Every one of those authenticates the medium *as a PS3 disc*.
+		const std::span<u8> input(ppu._sudo<u8>(static_cast<u32>(a1)), 0x18);
+		const u8 service = input[7];
+
+		sys_ss.notice("sys_ss_sec_hw_framework(0x5007): service 0x%02x, input: %s", service, input);
+
+		// Do not report a failure here, whatever medium is in the drive: _MediaDetect treats an
+		// error from this service as transient and retries it forever, then dereferences a null
+		// pointer. Tested by returning 0x8001051D for a staged PS1/PS2 disc - the VSH spun on the
+		// 0x43 (cellSsDrvAuthDiscChange) call ~13 times and crashed, never mounting anything.
 		return CELL_OK;
 	}
 	default: break;
@@ -605,6 +629,41 @@ error_code sys_ss_individual_info_manager(u64 pkg_id, u64 a2, vm::ptr<u64> out_s
 	// Get EID size
 	case 0x17001: *out_size = 0x100; break;
 	default: break;
+	}
+
+	return CELL_OK;
+}
+
+error_code sys_ss_disc_access_control(u64 pkg_id, u64 a1)
+{
+	sys_ss.warning("sys_ss_disc_access_control(pkg=0x%llx, a1=0x%llx)", pkg_id, a1);
+
+	switch (pkg_id)
+	{
+	// Query whether this console may run PlayStation 2 discs. The VSH asks for it right after it
+	// classifies a medium as PS2 (vsh.elf 0x518e48) and treats a zero answer as "this model has no
+	// PS2 support", dropping the disc as unsupported media before it is ever mounted. Like the
+	// model reported by sys_ss_appliance_info_manager and the word sys_sm_get_hw_config answers,
+	// this describes the machine and not the medium, so it does not follow what is in the tray.
+	case 0x20000:
+	{
+		const vm::ptr<u32> allowed = vm::cast(a1);
+
+		if (!allowed)
+		{
+			return CELL_EFAULT;
+		}
+
+		*allowed = 1;
+		break;
+	}
+	// The matching setter, used to open and close access around a disc change.
+	case 0x20001: break;
+	default:
+	{
+		sys_ss.todo("sys_ss_disc_access_control(): unknown packet 0x%llx", pkg_id);
+		break;
+	}
 	}
 
 	return CELL_OK;
