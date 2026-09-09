@@ -167,7 +167,7 @@ extern lv2_fs_mount_point g_mp_sys_no_device;
 std::string get_dev_ps2disc_path();
 
 // The SYSTEM.CNF key naming the executable of the disc staged there: "BOOT2" for a PlayStation 2
-// disc, empty when the folder holds none.
+// disc, "BOOT" for a PlayStation 1 one, empty when the folder holds neither.
 std::string get_dev_ps2disc_boot_key();
 
 struct lv2_fs_mount_info

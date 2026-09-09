@@ -55,9 +55,13 @@ std::string get_dev_ps2disc_boot_key()
 	}
 
 	// Read the key the way Loader/disc.cpp reads the same file, one line at a time and comparing
-	// the whole key: searching the file for "BOOT2" as a substring would match a disc that merely
-	// mentions it anywhere - in a value, on a stray line - and the firmware's own SYSTEM.CNF
-	// parser dereferences NULL on a file with no BOOT2 line.
+	// the whole key: searching the file for "BOOT2" as a substring would take a PlayStation 1 disc
+	// that merely mentions it anywhere - in a value, on a stray line - down the PlayStation 2 path,
+	// and the firmware's own SYSTEM.CNF parser dereferences NULL on a file with no BOOT2 line.
+	//
+	// BOOT2 wins when both are present: that is a PlayStation 2 disc carrying a PlayStation 1
+	// loader entry, and Loader/disc.cpp settles it the same way by taking the last line that
+	// matches.
 	std::string key;
 
 	for (const std::string& line : fmt::split(cnf.to_string(), {"\n"}))
@@ -69,17 +73,22 @@ std::string get_dev_ps2disc_boot_key()
 			continue;
 		}
 
-		if (fmt::trim_sv(std::string_view(line).substr(0, separator)) == "BOOT2")
+		if (const std::string_view name = fmt::trim_sv(std::string_view(line).substr(0, separator));
+			name == "BOOT2")
 		{
 			key = "BOOT2";
+		}
+		else if (name == "BOOT" && key.empty())
+		{
+			key = "BOOT";
 		}
 	}
 
 	return key;
 }
 
-// True when dev_ps2disc holds a PlayStation 2 disc.
-static bool is_ps2_disc_staged()
+// True when dev_ps2disc holds a PlayStation 1 or PlayStation 2 disc.
+static bool is_ps1_ps2_disc_staged()
 {
 	return !get_dev_ps2disc_boot_key().empty();
 }
@@ -560,10 +569,10 @@ lv2_fs_mount_point* lv2_fs_object::get_mp(std::string_view filename, std::string
 		{
 			*vfs_path = g_cfg_vfs.get(g_cfg_vfs.dev_bdvd, rpcs3::utils::get_emu_dir());
 
-			// There is only one optical drive. When a PS2 disc is staged and the dev_bdvd
+			// There is only one optical drive. When a PS1/PS2 disc is staged and the dev_bdvd
 			// folder holds no PS3 disc, dev_bdvd has to expose that same medium: otherwise the
 			// VSH inspects a different disc than the one sys_storage reports as inserted.
-			if (!fs::is_file(*vfs_path + "PS3_DISC.SFB") && is_ps2_disc_staged())
+			if (!fs::is_file(*vfs_path + "PS3_DISC.SFB") && is_ps1_ps2_disc_staged())
 			{
 				*vfs_path = get_dev_ps2disc_path();
 			}
