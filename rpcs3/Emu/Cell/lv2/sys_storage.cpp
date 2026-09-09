@@ -221,6 +221,33 @@ namespace
 		return (sectors > max_cd_sectors) ? ps_profile_ps_dvd : ps_profile_ps_cd;
 	}
 
+	// Enough of the medium to tell one disc from another without reading it. Presence alone would
+	// miss a disc swapped between two polls, so the root directory's timestamp comes along:
+	// optical media take it from the volume, so it differs from disc to disc, and asking for it
+	// costs one stat instead of the directory walk a content check would need.
+	struct medium_signature
+	{
+		bool present = false;
+		s64 timestamp = 0;
+
+		bool operator==(const medium_signature&) const = default;
+	};
+
+	// Watches the same folder the medium itself is read from, so what it reports and what
+	// get_staged_disc concludes always describe one disc.
+	medium_signature get_medium_signature()
+	{
+		const std::string path = get_dev_ps2disc_path();
+		fs::stat_t info{};
+
+		if (path.empty() || !fs::get_stat(path, info) || !info.is_directory)
+		{
+			return {};
+		}
+
+		return {true, info.mtime};
+	}
+
 	struct storage_manager_impl
 	{
 		storage_manager_impl(const storage_manager_impl&) = delete;
@@ -372,8 +399,57 @@ namespace
 			// Let the drive setup that follows that registration settle.
 			thread_ctrl::wait_for(2500000);
 
-			// Announce whatever the tray holds.
+			// A medium that is already there when the VSH boots is the tray having been loaded
+			// before the console was turned on, so announce it once without waiting for a change.
+			// This one goes out whatever the signature says, because a PS3 disc can also be a
+			// folder configured for dev_bdvd alone, which the signature below cannot see.
+			medium_signature current = get_medium_signature();
+
 			announce_medium();
+
+			// From here on follow the drive. The two halves the firmware understands are separate:
+			// event 3 carries a medium's profile and event 4 says the tray is empty, while 0x101
+			// and 0x102 are the drive itself arriving and going away (vsh.elf 0x519dd0). Only the
+			// medium ones belong here - tearing the device down on every disc change would take
+			// the drive with it (0x519fc8 -> 0x518834).
+			while (thread_ctrl::state() != thread_state::aborting)
+			{
+				thread_ctrl::wait_for(1000000);
+
+				const medium_signature sampled = get_medium_signature();
+
+				if (sampled == current)
+				{
+					continue;
+				}
+
+				// Read the tray before reporting anything about it. This also matters when the
+				// medium only went away: everything answered for the drive, its profile and its
+				// geometry, has to stop describing a disc that is no longer in it.
+				resolve_medium();
+
+				// A disc swapped for another is both halves in turn, so neither is an else.
+				//
+				// The event is all that is reported for a tray that went empty: the firmware takes
+				// medium state 5 from it alone (vsh.elf 0x519f30), while the drive itself carries
+				// on answering device commands out of the captured PS3 BD-ROM table, which
+				// describes a disc that is present. Answering those commands as an empty drive
+				// would mean inventing a response set that nothing here has ever captured.
+				if (current.present)
+				{
+					sys_storage.notice("storage_manager(): the medium was removed, reporting an empty tray");
+					send_event(0x0101000000000006, 0x0000000000000004, 0x0000000000000000, 0x0101000000000006);
+					thread_ctrl::wait_for(2500000);
+				}
+
+				if (sampled.present)
+				{
+					sys_storage.notice("storage_manager(): a medium was inserted, announcing it");
+					announce_medium();
+				}
+
+				current = sampled;
+			}
 		}
 
 		static constexpr auto thread_name = "VSH Storage Events"sv;
