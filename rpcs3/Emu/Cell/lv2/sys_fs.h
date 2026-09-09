@@ -163,6 +163,13 @@ struct lv2_fs_mount_point
 extern lv2_fs_mount_point g_mp_sys_dev_hdd0;
 extern lv2_fs_mount_point g_mp_sys_no_device;
 
+// Host folder backing /dev_ps2disc, the mount point the firmware puts a PlayStation 2 disc on.
+std::string get_dev_ps2disc_path();
+
+// The SYSTEM.CNF key naming the executable of the disc staged there: "BOOT2" for a PlayStation 2
+// disc, empty when the folder holds none.
+std::string get_dev_ps2disc_boot_key();
+
 struct lv2_fs_mount_info
 {
 	lv2_fs_mount_point* const mp;

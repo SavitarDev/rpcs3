@@ -16,6 +16,7 @@ struct cfg_vfs : cfg::node
 	cfg::string dev_flash2{ this, "/dev_flash2/", "$(EmulatorDir)dev_flash2/" };
 	cfg::string dev_flash3{ this, "/dev_flash3/", "$(EmulatorDir)dev_flash3/" };
 	cfg::string dev_bdvd{ this, "/dev_bdvd/", "$(EmulatorDir)dev_bdvd/" }; // Only mounted in some special cases
+	cfg::string dev_ps2disc{ this, "/dev_ps2disc/", "$(EmulatorDir)dev_ps2disc/" }; // PATA1 ISO9660 view of the optical drive (PS1/PS2 discs)
 	cfg::string games_dir{ this, "/games/", "$(EmulatorDir)games/" }; // Not mounted
 	cfg::string app_home{ this, "/app_home/" }; // Not mounted
 

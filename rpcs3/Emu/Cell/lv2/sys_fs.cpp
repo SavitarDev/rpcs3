@@ -33,6 +33,57 @@ lv2_fs_mount_point g_mp_sys_dev_root{"/", "CELL_FS_ADMINFS", "CELL_FS_ADMINFS:",
 lv2_fs_mount_point g_mp_sys_no_device{};
 lv2_fs_mount_info  g_mi_sys_not_found{}; // wrapper for &g_mp_sys_no_device
 
+std::string get_dev_ps2disc_path()
+{
+	return g_cfg_vfs.get(g_cfg_vfs.dev_ps2disc, rpcs3::utils::get_emu_dir());
+}
+
+std::string get_dev_ps2disc_boot_key()
+{
+	const std::string path = get_dev_ps2disc_path();
+
+	if (path.empty())
+	{
+		return {};
+	}
+
+	const fs::file cnf(path + "SYSTEM.CNF");
+
+	if (!cnf)
+	{
+		return {};
+	}
+
+	// Read the key the way Loader/disc.cpp reads the same file, one line at a time and comparing
+	// the whole key: searching the file for "BOOT2" as a substring would match a disc that merely
+	// mentions it anywhere - in a value, on a stray line - and the firmware's own SYSTEM.CNF
+	// parser dereferences NULL on a file with no BOOT2 line.
+	std::string key;
+
+	for (const std::string& line : fmt::split(cnf.to_string(), {"\n"}))
+	{
+		const usz separator = line.find('=');
+
+		if (separator == umax)
+		{
+			continue;
+		}
+
+		if (fmt::trim_sv(std::string_view(line).substr(0, separator)) == "BOOT2")
+		{
+			key = "BOOT2";
+		}
+	}
+
+	return key;
+}
+
+// True when dev_ps2disc holds a PlayStation 2 disc.
+static bool is_ps2_disc_staged()
+{
+	return !get_dev_ps2disc_boot_key().empty();
+}
+
 template<>
 void fmt_class_string<lv2_file_type>::format(std::string& out, u64 arg)
 {
@@ -506,9 +557,19 @@ lv2_fs_mount_point* lv2_fs_object::get_mp(std::string_view filename, std::string
 		else if (result == &g_mp_sys_dev_usb)
 			*vfs_path = g_cfg_vfs.get_device(g_cfg_vfs.dev_usb, mp_name, rpcs3::utils::get_emu_dir()).path;
 		else if (result == &g_mp_sys_dev_bdvd)
+		{
 			*vfs_path = g_cfg_vfs.get(g_cfg_vfs.dev_bdvd, rpcs3::utils::get_emu_dir());
+
+			// There is only one optical drive. When a PS2 disc is staged and the dev_bdvd
+			// folder holds no PS3 disc, dev_bdvd has to expose that same medium: otherwise the
+			// VSH inspects a different disc than the one sys_storage reports as inserted.
+			if (!fs::is_file(*vfs_path + "PS3_DISC.SFB") && is_ps2_disc_staged())
+			{
+				*vfs_path = get_dev_ps2disc_path();
+			}
+		}
 		else if (result == &g_mp_sys_dev_dvd)
-			*vfs_path = g_cfg_vfs.get(g_cfg_vfs.dev_bdvd, rpcs3::utils::get_emu_dir()); // For compatibility
+			*vfs_path = get_dev_ps2disc_path();
 		else if (result == &g_mp_sys_app_home)
 			*vfs_path = g_cfg_vfs.get(g_cfg_vfs.app_home, rpcs3::utils::get_emu_dir());
 		else if (result == &g_mp_sys_host_root && g_cfg.vfs.host_root)

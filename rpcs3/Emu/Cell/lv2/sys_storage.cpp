@@ -20,11 +20,205 @@ namespace
 		sys_storage.todo("Callstack:\n%s", ppu.dump_callstack());
 	}
 
+	// Layout of the buffer passed to sys_storage_(async_)send_device_command, reverse engineered
+	// from the BD drive documentation (lv2_atapi_cmnd_block, see the PS3 devwiki "BD Drive Reverse
+	// Engineering" page): a 32-byte ATAPI packet followed by 6 big-endian u32 fields.
+	enum : u32
+	{
+		atapi_cdb_offset  = 0x00, // pkt[0x20]: the ATAPI/MMC command descriptor block
+		atapi_pktlen      = 0x20, // 12 for ATAPI 8020
+		atapi_blocks      = 0x24,
+		atapi_block_size  = 0x28,
+		atapi_proto       = 0x2C, // 0 = non-data, 1 = PIO in, 2 = PIO out, 3 = DMA
+		atapi_in_out      = 0x30, // 0 = write, 1 = read
+		atapi_cmnd_size   = 0x38,
+	};
+
+	// MMC opcodes the VSH issues while probing the optical medium.
+	enum : u8
+	{
+		mmc_test_unit_ready         = 0x00,
+		mmc_read_toc                = 0x43,
+		mmc_get_configuration       = 0x46,
+		mmc_get_event_status_notify = 0x4A,
+		mmc_read_disc_information   = 0x51,
+		mmc_report_key              = 0xA4,
+		mmc_read_disc_structure     = 0xAD,
+		mmc_set_cd_speed            = 0xBB,
+	};
+
+	// GET CONFIGURATION feature numbers. 0xFF40 is in the vendor specific range and is how the
+	// firmware asks a Sony drive whether the medium it holds is a PlayStation one.
+	constexpr u16 mmc_feature_playstation_medium = 0xFF40;
+
+	// Sony reserved the 0xFF50-0xFF71 profile range for the PlayStation formats, and the VSH's
+	// media classifier (vsh.elf 0x5209b4) maps profiles to its internal media type with exactly
+	// this table - everything it does not know becomes 0xFFF0 ("Unknown media, code: 0x%x").
+	// The media type names come from the firmware's own code -> name table (vsh.elf 0x6de8c8,
+	// read by the formatter at 0x49bdcc): 1 PS3_BD, 2 PS3_DVD, 3 PS2_DVD, 4 PS2_CD, 5 PS1_CD,
+	// 6 BDROM, 7 BDMR, 8 BDMRE, 9 DVDROM, 0xC DVDPR, 0xE CDDA, 0xF SACD, 0x11 CDMR...
+	// The five reserved profiles map one to one, in order, onto those five media types.
+	//
+	// What the profile actually selects is the branch the medium is handled by, not the icon the
+	// XMB ends up drawing. Types 2 and 3 go through the PlayStation disc authentication at
+	// vsh.elf 0x518e2c - sys_ss_disc_access_control, cellSsDrvPs2DiscInsert, the PS2 flag, the
+	// /dev_ps2disc mount and the SYSTEM.CNF read - while types 1, 4 and 5 skip all of that and are
+	// mounted on /dev_bdvd (vsh.elf 0x51eb78 for type 1, mount mode 2 at 0x51eb18 and 0x51eb54 for
+	// the other two). The promoter that builds the XMB item does not see these media types
+	// directly - see get_staged_profile below for the translation that sits in between and for why
+	// a PS2 disc is announced the way it is.
+	//
+	// The CD/DVD distinction is not carried by the profile either: a PS2 disc announced as 0xFF60
+	// is drawn with item_tex_disc_cd_ps2 (the blue CD) when the geometry reported for it is CD
+	// sized and with item_tex_disc_dvd when it is DVD sized, so the firmware composes that from the
+	// medium's capacity, exactly like a real drive.
+	enum : u32
+	{
+		ps_profile_ps3_bd  = 0xFF50, // -> 1 PS3_BD
+		ps_profile_ps_cd   = 0xFF60, // -> 2 PS3_DVD, the route a PS2 CD  is announced through
+		ps_profile_ps_dvd  = 0xFF61, // -> 3 PS2_DVD, the route a PS2 DVD is announced through
+		ps_profile_ps2_cd  = 0xFF70, // -> 4 PS2_CD,  unused, see get_staged_profile
+		ps_profile_ps1_cd  = 0xFF71, // -> 5 PS1_CD,  unused
+	};
+
+	// REPORT KEY (0xA4) with key class 0xE0 and key format 3 answers 8 bytes whose last byte says
+	// which PlayStation generation pressed the medium (vsh.elf 0x51f244 asks for it). Three
+	// constraints in the firmware pin every value down between them:
+	//
+	//   - a plain CD/DVD/BD that answers 1, 2 or 3 is refused as contradictory (0x518bbc), so
+	//     those three values are the three PlayStation generations and nothing else;
+	//   - a PS3_BD medium that answers 2 or 3 is refused the same way (0x518c44), so 2 and 3 both
+	//     mean "not a PlayStation 3 disc" and 1 is the PlayStation 3 one;
+	//   - the PlayStation disc branch is entered only for 2 or 3 (0x518e2c) and the PS2 flag is
+	//     kept afterwards only when the value is exactly 2 (0x519748), so 2 is PlayStation 2.
+	//
+	// What 3 means is still open. Only a medium announced with one of the reserved PlayStation
+	// profiles reports a generation here at all.
+	enum : u8
+	{
+		ps_disc_generation_ps2 = 2,
+	};
+
+	// Storage command 0x11 (not an ATAPI packet): the drive answers with the same profile as
+	// above, as a big endian u32. The VSH reads it through vsh.elf 0x51f180 and rejects the
+	// medium when it comes back 0 or -1 (vsh.elf 0x521338).
+	constexpr u64 storage_cmd_get_profile = 0x11;
+
+	// READ DISC STRUCTURE (0xAD) CDB byte 1, bits 3-0: the medium the structure is requested for.
+	enum : u8
+	{
+		mmc_disc_structure_media_dvd = 0x00,
+		mmc_disc_structure_media_bd  = 0x01,
+	};
+
+	// The completion event's data2 field carries the command result. Eladash's captured response
+	// for READ DISC INFORMATION is 0x8000000002050000, which decodes exactly as
+	// (0x80000000 << 32) | status << 24 | sense_key << 16 | ASC << 8 | ASCQ with
+	// status 0x02 = CHECK CONDITION and sense key 0x05 = ILLEGAL REQUEST, so build failures the
+	// same way. ASC 0x30 / ASCQ 0x00 is "INCOMPATIBLE MEDIUM INSTALLED" (SPC-4 ASC table).
+	constexpr u64 make_atapi_sense(u8 status, u8 sense_key, u8 asc, u8 ascq)
+	{
+		return 0x8000000000000000ull | (u64{status} << 24) | (u64{sense_key} << 16) | (u64{asc} << 8) | u64{ascq};
+	}
+
+	constexpr u64 atapi_incompatible_medium = make_atapi_sense(0x02, 0x05, 0x30, 0x00);
+
+	// The medium staged for the optical drive on the dev_ps2disc mount point.
+	enum class staged_disc
+	{
+		none,
+		ps2, // SYSTEM.CNF with a BOOT2= line: DVD for the vast majority of titles
+	};
+
+	// A BOOT2 line in SYSTEM.CNF at the root of the disc is what marks a PlayStation 2 medium.
+	// Read through the same helper the dev_bdvd fallback in sys_fs uses, so the mount point and
+	// the drive never disagree about what is staged.
+	staged_disc get_staged_disc()
+	{
+		return (get_dev_ps2disc_boot_key() == "BOOT2") ? staged_disc::ps2 : staged_disc::none;
+	}
+
+	// How much data the staged medium holds, in 2048-byte user sectors, or zero when that cannot be
+	// measured. Measured from the disc contents, not from fs::statfs: when dev_ps2disc points at a
+	// host folder statfs answers with the size of the drive that folder lives on, which has nothing
+	// to do with the disc.
+	//
+	// fs::get_dir_size answers umax when it cannot walk the folder, which happens when the medium
+	// goes away between being recognized and being measured. Passing that on would describe a disc
+	// of 0x1FFFFFFFFFFFFF sectors, so report nothing instead - a folder holding a SYSTEM.CNF never
+	// measures zero on its own, which leaves zero to mean "unknown" for the callers.
+	u64 get_staged_disc_sectors()
+	{
+		constexpr u64 sector_size = 2048;
+
+		const u64 size = fs::get_dir_size(get_dev_ps2disc_path(), sector_size);
+
+		return (size == umax) ? 0 : size / sector_size;
+	}
+
+	// The profile to announce for the staged medium. A drive reports what the medium physically
+	// is, and PS2 titles shipped on both CD and DVD, so the two capacities have to be told apart:
+	// a CD-ROM cannot hold more than 99 minutes of data, which is 360000 sectors, so anything
+	// past that is a DVD.
+	//
+	// Which profile to announce, though, is not the one the classifier names after the format. The metadata
+	// layer does not work in the classifier's media types: it translates them through a table of
+	// its own before anything else sees them (mms.prx 0xaf0e8, searched by 0x7635c on the key at
+	// each 0x18 byte entry's +0 and answering with its +0xc), and across the PlayStation formats
+	// that translation is a reversal:
+	//
+	//     classifier 1 PS3_BD  -> 5      classifier 4 PS2_CD -> 2
+	//     classifier 2 PS3_DVD -> 4      classifier 5 PS1_CD -> 1
+	//     classifier 3 PS2_DVD -> 3
+	//
+	// The promoter switches on the translated value (x3_mdimp1 0x48a4, and identically the mini
+	// importer at mms_minimdimp_media_gamedisc 0x1b94), and its case names belong to that second
+	// enumeration: case 3 MMS_MEDIA_TYPE_PS2_DVD, case 4 MMS_MEDIA_TYPE_PS2_CD, case 5
+	// MMS_MEDIA_TYPE_PS1_CD. Cases 1 and 2 are the PlayStation 3 ones, and they only stat
+	// /dev_bdvd/PS3_GAME before giving up.
+	//
+	// So a medium arrives at the promoter one step removed from the profile it was announced with,
+	// and the PS2 disc has always relied on that: announced 0xFF60 the classifier calls it PS3_DVD,
+	// the translation turns that into 4 and the promoter builds a PS2 CD out of it. Announcing the
+	// same disc as 0xFF70, the classifier's own PS2_CD, translates to 2 and loses it - which is
+	// exactly what happened the one time that was tried.
+	u32 get_staged_profile(u64 sectors)
+	{
+		constexpr u64 max_cd_sectors = 99 * 60 * 75;
+
+		return (sectors > max_cd_sectors) ? ps_profile_ps_dvd : ps_profile_ps_cd;
+	}
+
 	struct storage_manager_impl
 	{
-		storage_manager_impl() {}
 		storage_manager_impl(const storage_manager_impl&) = delete;
 		int operator=(const storage_manager_impl&) = delete;
+
+		// What the tray holds, with the geometry and profile that follow from it. Resolved together
+		// whenever the medium changes rather than on demand: both readings measure the disc, which
+		// on a physical drive means walking its directories, and the VSH asks for them on nearly
+		// every device command. Device commands are served on guest threads, so these are read
+		// from threads other than the one that maintains them.
+		atomic_t<staged_disc> staged{staged_disc::none};
+		atomic_t<u64> sectors = 0;
+		atomic_t<u32> profile = 0;
+
+		storage_manager_impl() = default;
+
+		// Reads the tray. Called only by the thread that owns this object; everything else reads
+		// what it leaves behind - never from the constructor, which runs on whichever guest thread
+		// first asks for this object from inside a syscall, and measuring a disc means walking
+		// every directory on it. What it publishes last is staged, because that is what every
+		// reader tests before it trusts the other two.
+		void resolve_medium()
+		{
+			const staged_disc medium = get_staged_disc();
+			const u64 size = (medium == staged_disc::none) ? 0 : get_staged_disc_sectors();
+
+			sectors = size;
+			profile = (medium == staged_disc::none) ? 0 : get_staged_profile(size);
+			staged = medium;
+		}
 
 		// Set once the guest has re-registered its medium event port against an opened drive
 		// handle, which is the point at which it can actually service a medium event.
@@ -57,33 +251,56 @@ namespace
 
 		void announce_medium()
 		{
-			// Eladash's original sequence, minus the 0x101 wake-up that is sent separately at startup.
-			//
-			// The pauses are what space the sequence out for the firmware, and an aborting thread
-			// returns from them at once, so the abort has to be tested between the events as well:
-			// without that the whole sequence fires back to back into a guest that is being torn down.
-			constexpr u64 events[][2] =
-			{
-				{0x000000000000ff71, 0x0101000000000006},
-				{0, 0x0101000000000004},
-				{0, 0x0101000000000008},
-				{0x000000000000ff71, 0x0101000000000003},
-			};
+			const staged_disc medium = staged.load();
 
-			for (const auto& event : events)
+			if (medium == staged_disc::none)
 			{
-				if (thread_ctrl::state() == thread_state::aborting)
+				// Nothing on dev_ps2disc, so this is a PlayStation 3 medium or an empty tray:
+				// Eladash's original sequence, minus the 0x101 wake-up that is sent at startup.
+				// The pauses are what space the sequence out for the firmware, and an aborting
+				// thread returns from them at once, so the abort has to be tested between the
+				// events as well: without that the whole sequence fires back to back into a guest
+				// that is being torn down.
+				constexpr u64 events[][2] =
 				{
-					return;
+					{0x000000000000ff71, 0x0101000000000006},
+					{0, 0x0101000000000004},
+					{0, 0x0101000000000008},
+					{0x000000000000ff71, 0x0101000000000003},
+				};
+
+				for (const auto& event : events)
+				{
+					if (thread_ctrl::state() == thread_state::aborting)
+					{
+						return;
+					}
+
+					send_event(0x0101000000000006, 0x0000000000000003, event[0], event[1]);
+					thread_ctrl::wait_for(2500000);
 				}
 
-				send_event(0x0101000000000006, 0x0000000000000003, event[0], event[1]);
-				thread_ctrl::wait_for(2500000);
+				return;
 			}
+
+			// data2 of a medium event is the drive's current profile, handed straight to the VSH's
+			// media classifier (vsh.elf 0x518af8 -> 0x5209b4). Announcing the PlayStation profile of
+			// the staged disc is what takes _MediaDetect down the PS2 branch, where it reads
+			// /dev_ps2disc/SYSTEM.CNF for the title id (vsh.elf 0x518eb4 -> 0x517260) instead of
+			// treating the medium as a Blu-ray.
+			const u32 announced = profile.load();
+
+			sys_storage.notice("storage_manager(): announcing profile 0x%x for the staged %s disc", announced, "PS2");
+			send_event(0x0101000000000006, 0x0000000000000003, announced, 0x0101000000000006);
 		}
 
 		void operator()() noexcept
 		{
+			// Read the tray here rather than in the constructor: this thread has all the time it
+			// needs before the first event goes out, and nothing can observe the result until it
+			// does.
+			resolve_medium();
+
 			while (Emu.IsPausedOrReady())
 			{
 				thread_ctrl::wait_for(2500);
@@ -119,6 +336,7 @@ namespace
 			// Let the drive setup that follows that registration settle.
 			thread_ctrl::wait_for(2500000);
 
+			// Announce whatever the tray holds.
 			announce_medium();
 		}
 
@@ -263,6 +481,23 @@ error_code sys_storage_send_device_command(u32 dev_handle, u64 cmd, vm::ptr<void
 {
 	sys_storage.todo("sys_storage_send_device_command(dev_handle=0x%x, cmd=0x%llx, in=*0x%, inlen=0x%x, out=*0x%x, outlen=0x%x)", dev_handle, cmd, in, inlen, out, outlen);
 	log_callback(*cpu_thread::get_current<ppu_thread>());
+
+	// Same profile query as in the asynchronous path: the VSH reaches it through one shared
+	// wrapper, so answer it here too rather than depending on which one it picks. Only read what
+	// the storage manager already worked out, and only for the command it applies to: it is a
+	// named_thread, so asking for it with g_fxo->get would start the medium event thread off any
+	// device command that happened to arrive first.
+	if (cmd == storage_cmd_get_profile && outlen >= sizeof(u32))
+	{
+		if (const auto manager = g_fxo->try_get<storage_manager>();
+			manager && manager->staged.load() != staged_disc::none)
+		{
+			be_t<u32> profile{manager->profile.load()};
+
+			ensure(vm::try_access(out.addr(), &profile, sizeof(profile), true));
+			sys_storage.notice("sys_storage_send_device_command(): reporting profile 0x%x for the staged disc", profile);
+		}
+	}
 
 	return CELL_OK;
 }
@@ -517,6 +752,259 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 		}
 	}
 
+	// The captured response table above describes a PS3 BD-ROM, so on its own the VSH's
+	// _MediaDetect always concludes "Blu-ray" and never probes the PS2 path. When a PS2
+	// disc is staged on dev_ps2disc instead, answer the standard MMC probe commands the way a
+	// real drive holding a CD/DVD would, so the VSH classifies the medium correctly.
+	// One reading of the tray for the whole command. The thread that follows the drive can resolve
+	// a different medium at any point, and a drive answers a command about the disc it began it
+	// with rather than half about one disc and half about the next.
+	const staged_disc staged = manager.staged.load();
+	const u32 staged_profile = manager.profile.load();
+	const u64 staged_sectors = manager.sectors.load();
+
+	const u8 opcode = (cmd == 1 && data_in.size() >= atapi_cmnd_size) ? data_in[atapi_cdb_offset] : 0xFF;
+	bool answered_as_cd_dvd = false;
+
+	// Not an ATAPI packet: the drive's own "which profile is loaded" query. The VSH runs it twice
+	// before it accepts a PS2 medium and rejects the disc when it answers 0 or -1.
+	if (cmd == storage_cmd_get_profile && outlen >= sizeof(u32) && staged != staged_disc::none)
+	{
+		be_t<u32> profile{staged_profile};
+
+		ensure(vm::try_access(out.addr(), &profile, sizeof(profile), true));
+		found_ID = umax;
+		answered_as_cd_dvd = true;
+		response_event_data2 = 0;
+		response_event_data3 = 0;
+
+		sys_storage.notice("sys_storage_async_send_device_command(): reporting profile 0x%x for the staged disc", profile);
+	}
+
+	if (cmd == 1 && staged != staged_disc::none)
+	{
+		std::vector<u8> response;
+
+		switch (opcode)
+		{
+		case mmc_read_disc_structure:
+		{
+			// READ DISC STRUCTURE for BD media on a CD/DVD fails on real hardware with
+			// CHECK CONDITION / ILLEGAL REQUEST / INCOMPATIBLE MEDIUM INSTALLED - the medium
+			// simply has no Blu-ray structure to read - and refusing it is what makes the VSH
+			// stop treating the medium as a Blu-ray.
+			if ((data_in[atapi_cdb_offset + 1] & 0xF) == mmc_disc_structure_media_bd)
+			{
+				// A failed command transfers nothing, so leave the guest buffer cleared. Written
+				// through the same guarded path as every other answer here: the address comes from
+				// the guest and may name no memory at all.
+				if (outlen)
+				{
+					std::vector<u8> nothing(outlen);
+
+					ensure(vm::try_access(out.addr(), nothing.data(), static_cast<u32>(outlen), true));
+				}
+
+				found_ID = umax;
+				answered_as_cd_dvd = true;
+				response_event_data2 = atapi_incompatible_medium;
+				response_event_data3 = 0;
+				sys_storage.notice("sys_storage_async_send_device_command(): PS2 disc staged, refusing READ DISC STRUCTURE for BD media");
+			}
+
+			break;
+		}
+		case mmc_read_toc:
+		{
+			// READ TOC/PMA/ATIP, format 0 (MMC-5). The VSH asks for it while classifying a CD
+			// (vsh.elf 0x52030c, CDB "43 00 00 00 00 00 00 <alloc>") and parses the answer at
+			// 0x520628: bytes 0-1 are the TOC data length, byte 2 the first track and byte 3 the
+			// last track, followed by eight byte descriptors. 0x5208a0 then hands the answer to
+			// 0x520578, which walks those descriptors looking for the data bit in the ADR/Control
+			// field, and that is how it tells a data disc from an audio one. A game disc is one
+			// data track plus the lead out, and the first request only asks for the four byte
+			// header.
+			// A table of contents cannot be built without knowing where the lead out sits, and a
+			// drive that cannot read one fails the command rather than answering a disc of no
+			// length, so leave it to the captured table when the medium could not be measured.
+			//
+			// The addresses below are logical block addresses, which is what byte 1 bit 1 clear
+			// asks for. The VSH only ever asks that way, and answering minutes, seconds and frames
+			// as an LBA would misplace the lead out, so the MSF form is left to the captured table
+			// rather than answered in the wrong units.
+			if (staged_sectors && outlen >= 4 && !(data_in[atapi_cdb_offset + 1] & 0x02) && (data_in[atapi_cdb_offset + 2] & 0xF) == 0)
+			{
+				const be_t<u32> lead_out{static_cast<u32>(staged_sectors)};
+
+				// The four byte header followed by the track 1 and lead out descriptors. The
+				// length field counts everything after itself, so it is 18 while the structure
+				// is 20 bytes long, and the VSH asks for exactly that 18 on its second pass -
+				// answer whatever fits, the way a drive truncates to the allocation length.
+				u8 toc[20]{};
+
+				toc[1]  = 18;   // TOC data length: the two track numbers plus two descriptors
+				toc[2]  = 1;    // first track
+				toc[3]  = 1;    // last track
+				toc[5]  = 0x14; // ADR 1, control 4: a data track
+				toc[6]  = 1;    // track number, starting at LBA 0
+				toc[13] = 0x14;
+				toc[14] = 0xAA; // the lead out
+				std::memcpy(&toc[16], &lead_out, sizeof(lead_out));
+
+				response.resize(outlen);
+				std::memcpy(response.data(), toc, std::min<usz>(outlen, sizeof(toc)));
+
+				sys_storage.notice("sys_storage_async_send_device_command(): reporting a single data track, lead out at LBA %d, %d of %d bytes", lead_out, std::min<usz>(outlen, sizeof(toc)), outlen);
+			}
+
+			break;
+		}
+		case mmc_read_disc_information:
+		{
+			// Standard Disc Information (MMC-5). Eladash's captured PS3 BD-ROM answer reports the
+			// command as failed (CHECK CONDITION) and leaves byte 2 at 0xFF, which describes an
+			// erasable, random-access medium - a BD-RE, not a pressed disc. A PS2 game disc is
+			// a finalized read-only CD/DVD, so describe it as such and let the command succeed.
+			if (outlen >= 34)
+			{
+				response.resize(outlen);
+				response[1] = 0x20; // disc information length: 32
+				response[2] = 0x0E; // erasable 0, last session complete (11b), disc status complete (10b)
+				response[3] = 1;    // number of first track
+				response[4] = 1;    // number of sessions (LSB)
+				response[5] = 1;    // first track in last session (LSB)
+				response[6] = 1;    // last track in last session (LSB)
+				response[7] = 0x20; // URU: the medium may be read by any application
+				response[8] = 0;    // disc type: CD-DA or CD-ROM
+
+				// The disc type above is defined for CD media only, and the addresses that follow
+				// it - last session lead in, last possible lead out - are left at zero rather than
+				// made up. What a real drive answers here for a DVD is not captured anywhere, and
+				// nothing observed so far reads either of them.
+
+				sys_storage.notice("sys_storage_async_send_device_command(): reporting a finalized read-only medium for the staged PS2 disc");
+			}
+
+			break;
+		}
+		case mmc_get_configuration:
+		{
+			// MMC-5 feature header: u32 data length, u16 reserved, u16 current profile. Report the
+			// PlayStation profile of the medium, the same value the medium event and the profile
+			// query carry - 0xFF50-0xFF71 sit in the vendor specific part of the MMC profile
+			// space, which is what Sony allocated them from, and the VSH cross-checks the three
+			// against each other.
+			//
+			// With RT=01b the request names one feature in CDB bytes 2-3 and the drive answers with
+			// the header plus that feature's descriptor, or with the header alone when the feature
+			// is not current. vsh.elf 0x51f8f4 asks for two of them in a row and its answer is what
+			// the MMS metadata generator is told about the medium (0x521c58 -> 0x52f7a0, and it
+			// refuses to go on to the profile query at 0x5201b0 unless this comes back 1):
+			//
+			//   0xFF40, a Sony vendor feature: accepted only as {code 0xFF40, additional length 4}
+			//           whose data bytes 1 and 3 both read 1 (0x51f9ec - 0x51fa28). Present makes
+			//           the query answer 1, absent makes it answer 2, which is the refusal.
+			//   0x0080, MMC-5 Hybrid Disc: matched at 0x51fae0 and only decides the hybrid flag
+			//           that 0x51fb4c stores at ctx+0x4c, so a plain PlayStation disc leaves the
+			//           feature out and is reported as non hybrid.
+			if (outlen >= 8)
+			{
+				const u16 feature = static_cast<u16>((data_in[atapi_cdb_offset + 2] << 8) | data_in[atapi_cdb_offset + 3]);
+				const u8 request_type = data_in[atapi_cdb_offset + 1] & 3;
+				const bool wants_playstation_feature = request_type == 1 && feature == mmc_feature_playstation_medium;
+
+				response.resize(outlen);
+				response[3] = 4; // data length, big endian: the header alone
+				response[6] = static_cast<u8>(staged_profile >> 8);
+				response[7] = static_cast<u8>(staged_profile & 0xFF);
+
+				if (wants_playstation_feature && outlen >= 16)
+				{
+					response[3]  = 12;   // header plus one 8 byte descriptor
+					response[8]  = static_cast<u8>(mmc_feature_playstation_medium >> 8);
+					response[9]  = static_cast<u8>(mmc_feature_playstation_medium & 0xFF);
+					response[10] = 1;    // version 0, not persistent, current
+					response[11] = 4;    // additional length
+					response[13] = 1;
+					response[15] = 1;
+
+					sys_storage.notice("sys_storage_async_send_device_command(): reporting the PlayStation medium feature 0x%04x for the staged %s disc", feature, "PS2");
+					break;
+				}
+
+				sys_storage.notice("sys_storage_async_send_device_command(): reporting current profile 0x%04x for the staged %s disc (RT %d, feature 0x%04x)", staged_profile, "PS2", request_type, feature);
+			}
+
+			break;
+		}
+		case mmc_report_key:
+		{
+			// Vendor key class 0xE0 / key format 3: what kind of medium the drive holds, in the
+			// last byte of the 8 byte answer - the routine at vsh.elf 0x51f244 issues the command
+			// and takes that byte at 0x51f334. Eladash's captured table answers this one with
+			// zeros, which reads as "not a PlayStation disc" and makes the VSH refuse every
+			// PlayStation disc path outright.
+			//
+			// The answer has to agree with the profile: the VSH refuses as contradictory any
+			// medium whose profile says plain CD/DVD/BD while this byte claims a PlayStation
+			// generation (vsh.elf 0x518bbc), and it does so by publishing medium state 4,
+			// unsupported media. Only a medium announced with one of the reserved PlayStation
+			// profiles reports a generation here.
+			if (outlen == 8 && data_in[atapi_cdb_offset + 7] == 0xE0 && (data_in[atapi_cdb_offset + 10] & 0x3F) == 3)
+			{
+				response.resize(outlen);
+				response[7] = ps_disc_generation_ps2;
+
+				sys_storage.notice("sys_storage_async_send_device_command(): reporting PlayStation generation %d to REPORT KEY", response[7]);
+			}
+
+			break;
+		}
+		case mmc_get_event_status_notify:
+		{
+			// Media event class (requested through the notification class bitmask in CDB byte 4,
+			// bit 4). Report a present, unchanged medium so the VSH keeps the drive as loaded.
+			if (outlen >= 8 && (data_in[atapi_cdb_offset + 4] & 0x10))
+			{
+				response.resize(outlen);
+				response[1] = 6;    // event descriptor length
+				response[2] = 4;    // notification class: media
+				response[3] = 0x10; // supported event classes: media
+				response[4] = 0;    // event code: no change
+				response[5] = 0x02; // media status: media present, tray closed
+
+				sys_storage.notice("sys_storage_async_send_device_command(): reporting media present for the staged PS2 disc");
+			}
+
+			break;
+		}
+		default: break;
+		}
+
+		if (!response.empty())
+		{
+			found_ID = umax;
+			answered_as_cd_dvd = true;
+			response_event_data2 = 0;
+			response_event_data3 = 0;
+			ensure(vm::try_access(out.addr(), response.data(), static_cast<u32>(outlen), true));
+		}
+	}
+
+	if (found_ID == umax && !answered_as_cd_dvd)
+	{
+		// Log the opcode of everything the response table does not cover. This is what tells us
+		// which command variants the VSH falls back to once the Blu-ray path is refused.
+		if (cmd == 1)
+		{
+			sys_storage.notice("sys_storage_async_send_device_command(): unhandled ATAPI opcode 0x%02x (inlen=0x%x, outlen=0x%x)", opcode, inlen, outlen);
+		}
+		else
+		{
+			sys_storage.notice("sys_storage_async_send_device_command(): unhandled command 0x%llx (inlen=0x%x, outlen=0x%x)", cmd, inlen, outlen);
+		}
+	}
+
 	if (auto q = handle->async_port.load())
 	{
 		q->send(0, operation_name, response_event_data2, response_event_data3);
@@ -668,6 +1156,22 @@ error_code sys_storage_get_device_info(u64 device, vm::ptr<StorageDeviceInfo> bu
 
 		std::memcpy(&*buffer, data_mode_8, sizeof(data_mode_8));
 	//	buffer->sector_size = 0x200;
+
+		// The blob above describes a PS3 BD-ROM. When a PS2 disc is staged instead, report the
+		// geometry of that medium: 2048-byte user sectors, the same for CD, DVD and BD, and the
+		// capacity of the disc itself, so it does not contradict the profile reported for it.
+		//
+		// Only read what the storage manager already worked out, never bring it into being from
+		// here: it is a named_thread, so asking for it with g_fxo->get would start the medium
+		// event thread off a query that has nothing to do with medium events.
+		const auto manager = g_fxo->try_get<storage_manager>();
+
+		if (const u64 sector_count = manager ? manager->sectors.load() : 0)
+		{
+			buffer->sector_size = 2048;
+			buffer->sector_count = sector_count;
+			sys_storage.notice("sys_storage_get_device_info(): reporting %d sectors of 2048 bytes for the staged PS2 disc", sector_count);
+		}
 	}
 	else if (storage == USB_MASS_STORAGE_1(0))
 	{
