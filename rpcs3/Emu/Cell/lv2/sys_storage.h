@@ -88,6 +88,14 @@ struct StorageDeviceInfo
 #define USB_MASS_STORAGE_1(n) (USB_MASS_STORAGE_1_BASE + n)       /* For 0-5 */
 #define USB_MASS_STORAGE_2(n) (USB_MASS_STORAGE_2_BASE + (n - 6)) /* For 6-127 */
 
+// Puts the medium the emulator was told to boot in the tray, and reads it there and then.
+//
+// The VSH brings the drive up by probing it, and the thread that follows the tray starts along with
+// the first of those probes. An emulator booted straight from the game list has nobody to probe on
+// its behalf and asks the drive for a sector almost immediately, so the tray has to have been read
+// before it does: an unresolved medium answers every question the way an empty one would.
+void sys_storage_stage_boot_medium();
+
 // SysCalls
 class ppu_thread;
 

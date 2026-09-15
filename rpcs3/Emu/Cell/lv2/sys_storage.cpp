@@ -11,6 +11,11 @@
 #include "sys_storage.h"
 #include "sys_event.h"
 
+#ifdef _WIN32
+#include <Windows.h>
+#include <ntddscsi.h>
+#endif
+
 LOG_CHANNEL(sys_storage);
 
 namespace
@@ -248,6 +253,201 @@ namespace
 		return {true, info.mtime};
 	}
 
+#ifdef _WIN32
+	// The sense buffer has to live in the same allocation as the request: the driver is handed one
+	// block and told at which offset inside it the sense data begins.
+	struct atapi_pass_through
+	{
+		SCSI_PASS_THROUGH_DIRECT request;
+		u8 sense[32];
+	};
+#endif
+
+	// Putting an ATAPI packet to the drive the medium is really in. lv1 answers a storage device
+	// command by handing the packet to the BD drive, so where the tray holds a real disc in a real
+	// drive, the truthful answer to a command is the one that drive gives.
+	//
+	// Nothing else can answer the command a PlayStation 1 disc is read with. Its emulator asks for
+	// raw CD sectors - READ CD, with the sync pattern, both headers, the user data and the error
+	// correction alongside the formatted Q subchannel - and a filesystem mounted over a disc only
+	// ever exposes the user data sitting inside those sectors.
+	//
+	// Only what the answers below do not cover is ever put to it. What they cover is what a drive
+	// that is not Sony's gets wrong, and asking one was how that was established: holding this very
+	// disc it answers GET CONFIGURATION with profile 0x0008, a plain CD-ROM, where the firmware is
+	// looking for one of the reserved PlayStation profiles; it answers the 0xFF40 PlayStation medium
+	// feature with a header and no feature at all; and it turns down READ DISC STRUCTURE and REPORT
+	// KEY outright, sense key 5 with ASC 0x30/0x02, incompatible medium. Two of the three answer,
+	// which is worse than a refusal, because an answer is believed.
+	class optical_drive
+	{
+	public:
+		optical_drive() = default;
+		optical_drive(const optical_drive&) = delete;
+		int operator=(const optical_drive&) = delete;
+
+		~optical_drive()
+		{
+			close();
+		}
+
+		// True when a drive answered. False means the packet never reached one, which is not the
+		// same as a drive turning it down: a refusal is an answer, and comes back as sense data.
+		//
+		// How many bytes the drive put in the buffer is reported through transferred, which is not
+		// the same as how many were asked for: a command answers with what it has. A drive writes
+		// the bytes it transfers and no others, so the rest of the buffer is not the drive's to
+		// speak for.
+		bool send_atapi_command([[maybe_unused]] const u8* cdb, [[maybe_unused]] u32 cdb_size, [[maybe_unused]] u8* buffer, [[maybe_unused]] u32 buffer_size, u32& transferred)
+		{
+			transferred = 0;
+
+			std::lock_guard lock(mutex);
+
+#ifdef _WIN32
+			if (!open())
+			{
+				return false;
+			}
+
+			atapi_pass_through packet{};
+
+			packet.request.Length             = static_cast<u16>(sizeof(SCSI_PASS_THROUGH_DIRECT));
+			packet.request.CdbLength          = static_cast<u8>(std::min<u32>(cdb_size, static_cast<u32>(sizeof(packet.request.Cdb))));
+			packet.request.SenseInfoLength    = static_cast<u8>(sizeof(packet.sense));
+			packet.request.SenseInfoOffset    = static_cast<u32>(offsetof(atapi_pass_through, sense));
+			packet.request.DataIn             = buffer_size ? SCSI_IOCTL_DATA_IN : SCSI_IOCTL_DATA_UNSPECIFIED;
+			packet.request.DataTransferLength = buffer_size;
+			packet.request.DataBuffer         = buffer_size ? buffer : nullptr;
+
+			// Seconds, and a bound rather than a figure from the console: it is here so that a drive
+			// that stops answering does not hold the guest thread forever. One sector read off this
+			// disc takes 3.3 ms, and 71 ms when the head has to move, both measured over a boot, so
+			// ten seconds is far past anything a working drive does and still short of a hang.
+			packet.request.TimeOutValue       = 10;
+
+			std::memcpy(packet.request.Cdb, cdb, packet.request.CdbLength);
+
+			DWORD returned = 0;
+
+			if (!DeviceIoControl(handle, IOCTL_SCSI_PASS_THROUGH_DIRECT, &packet, static_cast<DWORD>(sizeof(packet)), &packet, static_cast<DWORD>(sizeof(packet)), &returned, nullptr))
+			{
+				// Losing the drive is how an ejected or swapped medium reaches this far. Let go of
+				// the handle so the next command opens whatever the tray holds by then.
+				sys_storage.warning("optical_drive: ATAPI opcode 0x%02x could not be sent (error 0x%x)", cdb[0], +GetLastError());
+				close();
+				return false;
+			}
+
+			// Updated by the driver to what the drive actually put across.
+			transferred = std::min<u32>(packet.request.DataTransferLength, buffer_size);
+
+			if (packet.request.ScsiStatus)
+			{
+				// The drive answered and its answer is a refusal, which is a truthful answer about
+				// the disc. The caller passes on the empty buffer that comes with it.
+				sys_storage.notice("optical_drive: ATAPI opcode 0x%02x refused (status 0x%02x, sense key 0x%x, asc 0x%02x/0x%02x)",
+					cdb[0], packet.request.ScsiStatus, packet.sense[2] & 0xF, packet.sense[12], packet.sense[13]);
+			}
+
+			return true;
+#else
+			// Windows only for the time being. Elsewhere the medium is reached through the mount
+			// point rather than the device behind it, and finding that device is its own work.
+			return false;
+#endif
+		}
+
+		// Let go of the drive. Called when the tray is read again, so a swapped medium is never
+		// answered for through a handle opened against the one before it.
+		void reset()
+		{
+			std::lock_guard lock(mutex);
+
+			close();
+			unavailable = false;
+		}
+
+	private:
+#ifdef _WIN32
+		// Opens the volume the medium is mounted as. Called with the mutex held.
+		bool open()
+		{
+			if (handle != INVALID_HANDLE_VALUE)
+			{
+				return true;
+			}
+
+			if (unavailable)
+			{
+				return false;
+			}
+
+			// "D:/" mounted over the disc is reached as "\\.\D:", which is how the filesystem is
+			// talked past to the drive holding it.
+			//
+			// Only an optical one. A folder standing in for a disc has no ATAPI bus to ask, and one
+			// sitting on a fixed disk would otherwise be read as its letter and aim these packets at
+			// somebody's hard drive, which is not where a command meant for a CD belongs.
+			const std::string path = get_dev_ps2disc_path();
+
+			if (path.size() < 2 || path[1] != ':')
+			{
+				unavailable = true;
+				return false;
+			}
+
+			const std::string root = path.substr(0, 2) + "\\";
+
+			if (GetDriveTypeA(root.c_str()) != DRIVE_CDROM)
+			{
+				sys_storage.notice("optical_drive: '%s' is not an optical drive, answering from the medium alone", root);
+				unavailable = true;
+				return false;
+			}
+
+			const std::string device = "\\\\.\\" + path.substr(0, 2);
+
+			handle = CreateFileA(device.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+
+			if (handle == INVALID_HANDLE_VALUE)
+			{
+				// Read and write rights are what the pass through interface asks for even to read.
+				// Said once rather than once for every sector the guest goes on to ask for.
+				sys_storage.warning("optical_drive: cannot open '%s' (error 0x%x)", device, +GetLastError());
+				unavailable = true;
+				return false;
+			}
+
+			sys_storage.notice("optical_drive: sending ATAPI packets to '%s'", device);
+			return true;
+		}
+
+		void close()
+		{
+			if (handle != INVALID_HANDLE_VALUE)
+			{
+				CloseHandle(handle);
+				handle = INVALID_HANDLE_VALUE;
+			}
+		}
+
+		HANDLE handle = INVALID_HANDLE_VALUE;
+#else
+		// There is no handle to let go of where no drive is ever opened, but the destructor and
+		// reset still ask, so the question stays answerable on every platform.
+		void close()
+		{
+		}
+#endif
+
+		// Set once opening has failed, so a mount point with no drive behind it is reported once
+		// instead of once per command. Cleared along with the handle when the tray is read again.
+		bool unavailable = false;
+
+		shared_mutex mutex;
+	};
+
 	struct storage_manager_impl
 	{
 		storage_manager_impl(const storage_manager_impl&) = delete;
@@ -264,6 +464,10 @@ namespace
 
 		storage_manager_impl() = default;
 
+		// The drive the medium is read through. Owned here because this is what follows the tray: a
+		// handle opened against one disc has no business answering about the next.
+		optical_drive drive;
+
 		// Reads the tray. Called only by the thread that owns this object; everything else reads
 		// what it leaves behind - never from the constructor, which runs on whichever guest thread
 		// first asks for this object from inside a syscall, and measuring a disc means walking
@@ -273,6 +477,8 @@ namespace
 		{
 			const staged_disc medium = get_staged_disc();
 			const u64 size = (medium == staged_disc::none) ? 0 : get_staged_disc_sectors();
+
+			drive.reset();
 
 			sectors = size;
 			profile = (medium == staged_disc::none) ? 0 : get_staged_profile(medium, size);
@@ -489,6 +695,17 @@ bool lv2_storage_medium_event_port::savable() const
 	return lv2_obj::check(medium_port);
 }
 
+void sys_storage_stage_boot_medium()
+{
+	// Asking for the manager is what creates it, and creating it starts the thread that follows the
+	// tray. That thread reads the medium as its first act, but the boot carries on without waiting
+	// for it, so read the tray here as well: this runs before there is a guest to observe either
+	// result, and both readings describe the same disc.
+	auto& manager = g_fxo->get<storage_manager>();
+
+	manager.resolve_medium();
+}
+
 error_code sys_storage_open(ppu_thread& ppu, u64 device, u64 mode, vm::ptr<u32> fd, u64 flags)
 {
 	sys_storage.todo("sys_storage_open(device=0x%x, mode=0x%x, fd=*0x%x, flags=0x%x)", device, mode, fd, flags);
@@ -589,31 +806,6 @@ error_code sys_storage_write(u32 fd, u32 mode, u32 start_sector, u32 num_sectors
 	return CELL_OK;
 }
 
-error_code sys_storage_send_device_command(u32 dev_handle, u64 cmd, vm::ptr<void> in, u64 inlen, vm::ptr<void> out, u64 outlen)
-{
-	sys_storage.todo("sys_storage_send_device_command(dev_handle=0x%x, cmd=0x%llx, in=*0x%, inlen=0x%x, out=*0x%x, outlen=0x%x)", dev_handle, cmd, in, inlen, out, outlen);
-	log_callback(*cpu_thread::get_current<ppu_thread>());
-
-	// Same profile query as in the asynchronous path: the VSH reaches it through one shared
-	// wrapper, so answer it here too rather than depending on which one it picks. Only read what
-	// the storage manager already worked out, and only for the command it applies to: it is a
-	// named_thread, so asking for it with g_fxo->get would start the medium event thread off any
-	// device command that happened to arrive first.
-	if (cmd == storage_cmd_get_profile && outlen >= sizeof(u32))
-	{
-		if (const auto manager = g_fxo->try_get<storage_manager>();
-			manager && manager->staged.load() != staged_disc::none)
-		{
-			be_t<u32> profile{manager->profile.load()};
-
-			ensure(vm::try_access(out.addr(), &profile, sizeof(profile), true));
-			sys_storage.notice("sys_storage_send_device_command(): reporting profile 0x%x for the staged disc", profile);
-		}
-	}
-
-	return CELL_OK;
-}
-
 error_code sys_storage_async_configure(u32 fd, u32 io_buf, u32 equeue_id, u32 unk)
 {
 	sys_storage.todo("sys_storage_async_configure(fd=0x%x, io_buf=0x%x, equeue_id=0x%x, unk=*0x%x)", fd, io_buf, equeue_id, unk);
@@ -638,20 +830,34 @@ error_code sys_storage_async_configure(u32 fd, u32 io_buf, u32 equeue_id, u32 un
 	return CELL_OK;
 }
 
-error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::ptr<void> in, u64 inlen, vm::ptr<void> out, u64 outlen, u64 operation_name)
+// What a device command is answered with does not depend on which syscall carried it. lv1 puts the
+// same packet to the same drive either way, and the only thing the asynchronous entry point adds is
+// the completion event it posts afterwards, so both of them come through here.
+//
+// Which is what a PlayStation 1 disc depends on. ps1_emu reaches the drive from xcdrom.cc, through
+// its _xcd_reader_thread and _xcdrom_thread, and every one of those calls takes the synchronous
+// syscall: one boot of a disc put 109 commands through it and none through the asynchronous one,
+// which is the path the VSH uses. They ask the same ATAPI questions about the same disc.
+//
+// The event data a command produces belongs to the command rather than to the transport, so it is
+// returned here and posted by the caller that has somewhere to post it.
+//
+// What is logged here says this function rather than either syscall, because either one of them
+// may be the caller and a line that names the wrong one is worse than one that names neither.
+struct storage_command_response
 {
-	sys_storage.todo("sys_storage_async_send_device_command(dev_handle=0x%x, cmd=0x%llx, in=*0x%x, inlen=0x%x, out=*0x%x, outlen=0x%x, operation_name=0x%x)", dev_handle, cmd, in, inlen, out, outlen, operation_name);
-	sys_storage.todo("sys_storage_async_send_device_command(): BUF: %s", std::span<u8>(vm::get_super_ptr(in.addr()), inlen));
-	log_callback(*cpu_thread::get_current<ppu_thread>());
+	u64 event_data2 = 0;
+	u64 event_data3 = 0;
+};
 
-	auto& manager = g_fxo->get<storage_manager>();
+static storage_command_response storage_device_command(u64 cmd, vm::ptr<void> in, u64 inlen, vm::ptr<void> out, u64 outlen)
+{
+	sys_storage.todo("storage_device_command(): BUF: %s", std::span<u8>(vm::get_super_ptr(in.addr()), inlen));
 
-	const auto handle = idm::get_unlocked<lv2_obj, lv2_storage>(dev_handle);
-
-	if (!handle)
-	{
-		return CELL_ESRCH;
-	}
+	// try_get rather than get: the manager is a named_thread, and starting the medium event thread
+	// is the asynchronous entry point's business, not something a command should do by arriving
+	// first. Nothing staged reads the same as an empty tray, which is the truth until it has run.
+	const auto manager = g_fxo->try_get<storage_manager>();
 
 	std::vector<u8> data_in(inlen);
 
@@ -853,7 +1059,7 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 				// A known opcode issued with an unexpected allocation length. Answer with an empty
 				// buffer instead of aborting the emulator: non-PS3 media make the VSH use command
 				// variants that the reverse engineered PS3 BD-ROM table does not cover.
-				sys_storage.warning("sys_storage_async_send_device_command(): command ID=%d expects a 0x%x byte response, guest asked for 0x%x", info.ID, info.response_base.size(), outlen);
+				sys_storage.warning("storage_device_command(): command ID=%d expects a 0x%x byte response, guest asked for 0x%x", info.ID, info.response_base.size(), outlen);
 				continue;
 			}
 
@@ -871,12 +1077,81 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 	// One reading of the tray for the whole command. The thread that follows the drive can resolve
 	// a different medium at any point, and a drive answers a command about the disc it began it
 	// with rather than half about one disc and half about the next.
-	const staged_disc staged = manager.staged.load();
-	const u32 staged_profile = manager.profile.load();
-	const u64 staged_sectors = manager.sectors.load();
+	const staged_disc staged = manager ? manager->staged.load() : staged_disc::none;
+	const u32 staged_profile = manager ? manager->profile.load() : 0;
+	const u64 staged_sectors = manager ? manager->sectors.load() : 0;
 
 	const u8 opcode = (cmd == 1 && data_in.size() >= atapi_cmnd_size) ? data_in[atapi_cdb_offset] : 0xFF;
 	bool answered_as_cd_dvd = false;
+
+	// Handing the packet the guest wrote to the drive the medium is really in, and passing back what
+	// comes out. False means no drive answered it, and the caller falls back to the answers worked
+	// out below.
+	//
+	// Reads, and commands that carry no data at all: telling a drive it is about to be read from is
+	// part of reading it. A write stays out - nothing a disc is read through needs one, and letting
+	// one reach somebody's drive is not a thing to do by accident. Read off the packets ps1_emu
+	// sends: READ CD, GET EVENT STATUS, READ DISC INFORMATION and READ TOC all arrive as protocol 3
+	// with direction 1, DMA and read, while SET CD SPEED arrives as protocol 0, no data at all.
+	const auto ask_the_drive = [&]() -> bool
+	{
+		if (cmd != 1 || !manager || staged == staged_disc::none || data_in.size() < atapi_cmnd_size)
+		{
+			return false;
+		}
+
+		// The protocol and direction fields are big-endian u32, so the value sits in the last byte.
+		if (data_in[atapi_proto + 3] != 0 && data_in[atapi_in_out + 3] != 1)
+		{
+			return false;
+		}
+
+		const u32 cdb_size = data_in[atapi_pktlen + 3];
+
+		if (!cdb_size)
+		{
+			return false;
+		}
+
+		std::vector<u8> answer(outlen);
+		u32 transferred = 0;
+
+		if (!manager->drive.send_atapi_command(data_in.data() + atapi_cdb_offset, cdb_size, answer.data(), static_cast<u32>(outlen), transferred))
+		{
+			return false;
+		}
+
+		// Only as far as the drive answered. What it did not write is not its to write, and the
+		// buffer was zeroed above, so what the guest reads past that point is what lv2 left rather
+		// than something this made up.
+		if (transferred)
+		{
+			ensure(vm::try_access(out.addr(), answer.data(), transferred, true));
+		}
+
+		return true;
+	};
+
+	// What the medium's own layout is, as opposed to what kind of medium the firmware should believe
+	// it is. A drive holding the disc knows where its tracks and its lead out actually sit, and the
+	// emulator reading the disc needs that: the table of contents answered below is built out of the
+	// size of the files on the medium, which is not its geometry.
+	//
+	// Measured, not assumed. Answering READ TOC from the files puts the lead out at LBA 327165 and
+	// the emulator never finds what it is looking for: it rereads LBA 0x04 to 0x1C without end, 1031
+	// READ CD commands over 42 passes of the same 25 sectors, while the drive answers every one of
+	// them. Asking the drive instead, the same disc reads its descriptors once, LBA 0x10 to 0x1D in
+	// 23 commands, and goes on to what it found there.
+	//
+	// Everything else stays as it is answered below, because a drive that is not Sony's answers the
+	// rest wrongly rather than not at all: profile 0x0008 for a medium the firmware needs a reserved
+	// PlayStation profile for, and no 0xFF40 feature where it looks for one. See optical_drive.
+	if ((opcode == mmc_read_toc || opcode == mmc_read_disc_information) && ask_the_drive())
+	{
+		// The drive answered, so the event reports the plain success every other answered command
+		// reports rather than the sense the captured table would have paired with it.
+		return storage_command_response{};
+	}
 
 	// Not an ATAPI packet: the drive's own "which profile is loaded" query. The VSH runs it twice
 	// before it accepts a PS1/PS2 medium and rejects the disc when it answers 0 or -1.
@@ -890,7 +1165,7 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 		response_event_data2 = 0;
 		response_event_data3 = 0;
 
-		sys_storage.notice("sys_storage_async_send_device_command(): reporting profile 0x%x for the staged disc", profile);
+		sys_storage.notice("storage_device_command(): reporting profile 0x%x for the staged disc", profile);
 	}
 
 	if (cmd == 1 && staged != staged_disc::none)
@@ -929,7 +1204,7 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 				answered_as_cd_dvd = true;
 				response_event_data2 = atapi_incompatible_medium;
 				response_event_data3 = 0;
-				sys_storage.notice("sys_storage_async_send_device_command(): PS1/PS2 disc staged, refusing READ DISC STRUCTURE for BD media");
+				sys_storage.notice("storage_device_command(): PS1/PS2 disc staged, refusing READ DISC STRUCTURE for BD media");
 			}
 
 			break;
@@ -974,7 +1249,7 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 				response.resize(outlen);
 				std::memcpy(response.data(), toc, std::min<usz>(outlen, sizeof(toc)));
 
-				sys_storage.notice("sys_storage_async_send_device_command(): reporting a single data track, lead out at LBA %d, %d of %d bytes", lead_out, std::min<usz>(outlen, sizeof(toc)), outlen);
+				sys_storage.notice("storage_device_command(): reporting a single data track, lead out at LBA %d, %d of %d bytes", lead_out, std::min<usz>(outlen, sizeof(toc)), outlen);
 			}
 
 			break;
@@ -1002,7 +1277,7 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 				// made up. What a real drive answers here for a DVD is not captured anywhere, and
 				// nothing observed so far reads either of them.
 
-				sys_storage.notice("sys_storage_async_send_device_command(): reporting a finalized read-only medium for the staged PS1/PS2 disc");
+				sys_storage.notice("storage_device_command(): reporting a finalized read-only medium for the staged PS1/PS2 disc");
 			}
 
 			break;
@@ -1048,11 +1323,11 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 					response[13] = 1;
 					response[15] = 1;
 
-					sys_storage.notice("sys_storage_async_send_device_command(): reporting the PlayStation medium feature 0x%04x for the staged %s disc", feature, (staged == staged_disc::ps1) ? "PS1" : "PS2");
+					sys_storage.notice("storage_device_command(): reporting the PlayStation medium feature 0x%04x for the staged %s disc", feature, (staged == staged_disc::ps1) ? "PS1" : "PS2");
 					break;
 				}
 
-				sys_storage.notice("sys_storage_async_send_device_command(): reporting current profile 0x%04x for the staged %s disc (RT %d, feature 0x%04x)", staged_profile, (staged == staged_disc::ps1) ? "PS1" : "PS2", request_type, feature);
+				sys_storage.notice("storage_device_command(): reporting current profile 0x%04x for the staged %s disc (RT %d, feature 0x%04x)", staged_profile, (staged == staged_disc::ps1) ? "PS1" : "PS2", request_type, feature);
 			}
 
 			break;
@@ -1081,7 +1356,7 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 				response.resize(outlen);
 				response[7] = playstation_2_medium ? ps_disc_generation_ps2 : ps_disc_generation_none;
 
-				sys_storage.notice("sys_storage_async_send_device_command(): reporting PlayStation generation %d to REPORT KEY", response[7]);
+				sys_storage.notice("storage_device_command(): reporting PlayStation generation %d to REPORT KEY", response[7]);
 			}
 
 			break;
@@ -1099,7 +1374,7 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 				response[4] = 0;    // event code: no change
 				response[5] = 0x02; // media status: media present, tray closed
 
-				sys_storage.notice("sys_storage_async_send_device_command(): reporting media present for the staged PS1/PS2 disc");
+				sys_storage.notice("storage_device_command(): reporting media present for the staged PS1/PS2 disc");
 			}
 
 			break;
@@ -1119,21 +1394,65 @@ error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::pt
 
 	if (found_ID == umax && !answered_as_cd_dvd)
 	{
+		// Nothing above knows this command. If the medium is a real disc in a real drive then the
+		// drive does, so let it answer. This is the path READ CD takes, and with it every sector a
+		// PlayStation 1 disc is read through.
+		if (ask_the_drive())
+		{
+			return storage_command_response{};
+		}
+
 		// Log the opcode of everything the response table does not cover. This is what tells us
 		// which command variants the VSH falls back to once the Blu-ray path is refused.
 		if (cmd == 1)
 		{
-			sys_storage.notice("sys_storage_async_send_device_command(): unhandled ATAPI opcode 0x%02x (inlen=0x%x, outlen=0x%x)", opcode, inlen, outlen);
+			sys_storage.notice("storage_device_command(): unhandled ATAPI opcode 0x%02x (inlen=0x%x, outlen=0x%x)", opcode, inlen, outlen);
 		}
 		else
 		{
-			sys_storage.notice("sys_storage_async_send_device_command(): unhandled command 0x%llx (inlen=0x%x, outlen=0x%x)", cmd, inlen, outlen);
+			sys_storage.notice("storage_device_command(): unhandled command 0x%llx (inlen=0x%x, outlen=0x%x)", cmd, inlen, outlen);
 		}
 	}
 
+	return storage_command_response{response_event_data2, response_event_data3};
+}
+
+error_code sys_storage_send_device_command(u32 dev_handle, u64 cmd, vm::ptr<void> in, u64 inlen, vm::ptr<void> out, u64 outlen)
+{
+	sys_storage.todo("sys_storage_send_device_command(dev_handle=0x%x, cmd=0x%llx, in=*0x%x, inlen=0x%x, out=*0x%x, outlen=0x%x)", dev_handle, cmd, in, inlen, out, outlen);
+	log_callback(*cpu_thread::get_current<ppu_thread>());
+
+	// The same packet, put to the same drive, and answered the same way: lv1 does not keep two
+	// sets of answers, one per syscall. What this one does not have is a queue to report a
+	// completion to, so the event data the command produced is dropped here. The handle is not
+	// looked up either, because this syscall never looked it up: what lv2 answers here to one it
+	// does not know is not written down anywhere, and the asynchronous path is not evidence of it.
+	storage_device_command(cmd, in, inlen, out, outlen);
+
+	return CELL_OK;
+}
+
+error_code sys_storage_async_send_device_command(u32 dev_handle, u64 cmd, vm::ptr<void> in, u64 inlen, vm::ptr<void> out, u64 outlen, u64 operation_name)
+{
+	sys_storage.todo("sys_storage_async_send_device_command(dev_handle=0x%x, cmd=0x%llx, in=*0x%x, inlen=0x%x, out=*0x%x, outlen=0x%x, operation_name=0x%x)", dev_handle, cmd, in, inlen, out, outlen, operation_name);
+	log_callback(*cpu_thread::get_current<ppu_thread>());
+
+	// Bring the medium event thread up. This is the path the VSH probes the drive through, so it is
+	// the one that decides the manager exists before anything asks what is in the tray.
+	g_fxo->get<storage_manager>();
+
+	const auto handle = idm::get_unlocked<lv2_obj, lv2_storage>(dev_handle);
+
+	if (!handle)
+	{
+		return CELL_ESRCH;
+	}
+
+	const storage_command_response response = storage_device_command(cmd, in, inlen, out, outlen);
+
 	if (auto q = handle->async_port.load())
 	{
-		q->send(0, operation_name, response_event_data2, response_event_data3);
+		q->send(0, operation_name, response.event_data2, response.event_data3);
 	}
 
 	return CELL_OK;
