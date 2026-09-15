@@ -460,8 +460,43 @@ static void ppu_initialize_modules(shared_ptr<lv2_process> process, ppu_linkage_
 		g_ppu_function_names[1] = "HLE RETURN";
 	}
 
-	// For HLE variable allocation
-	u32 alloc_addr = 0;
+	// Where the HLE variables go, worked out before any of them is placed.
+	//
+	// A vm::gvar holds one thing, the guest address of its variable, and there is one gvar for
+	// the emulator rather than one per process. That address is turned into memory through
+	// vm::g_base_addr, which every process already has its own of, so the same address in two
+	// processes is two separate pieces of memory. What could not be shared was never the storage,
+	// only the one address, and laying every process out identically is what makes the one
+	// address true for all of them.
+	//
+	// The layout is the same everywhere because it is derived from the registered modules, which
+	// are the same everywhere, in the order this walks them.
+	u32 hle_vars_size = 0;
+	u32 hle_vars_align = 0x10000;
+
+	for (auto& pair : ppu_module_manager::get())
+	{
+		for (auto& variable : pair.second->variables)
+		{
+			hle_vars_size = utils::align(hle_vars_size, variable.second.align) + variable.second.size;
+			hle_vars_align = std::max<u32>(hle_vars_align, variable.second.align);
+		}
+	}
+
+	// At the top of main, which is the last place vm::alloc reaches: it hands out the lowest free
+	// address, and that is where an executable's segments and a game's first allocations want to
+	// be. Main ends at 0x10000000, so counting down from there leaves the block aligned to its
+	// own size without a figure being picked for it.
+	const u32 hle_vars_bytes = utils::align(hle_vars_size, hle_vars_align);
+	const u32 hle_vars_addr = 0x10000000 - hle_vars_bytes;
+	u32 hle_vars_offset = 0;
+
+	// Restoring a savestate brings the memory back with it, so there is nothing to reserve and
+	// the addresses come from the stream.
+	if (!ar && hle_vars_bytes && !vm::falloc(hle_vars_addr, hle_vars_bytes, vm::main))
+	{
+		fmt::throw_exception("ppu_initialize_modules(): failed to reserve the HLE variables (addr=0x%x, size=0x%x)", hle_vars_addr, hle_vars_bytes);
+	}
 
 	// "Use" all the modules for correct linkage
 	if (ppu_loader.trace)
@@ -567,36 +602,16 @@ static void ppu_initialize_modules(shared_ptr<lv2_process> process, ppu_linkage_
 		{
 			ppu_loader.trace("** &0x%08X: %s (size=0x%x, align=0x%x)", variable.first, variable.second.name, variable.second.size, variable.second.align);
 
-			if (process->ELF_file_path.find("/dev_flash/") != umax)
-			{
-				continue;
-			}
-
-			// Allocate HLE variable
+			// Place the HLE variable, at the same offset in every process
 			if (ar)
 			{
 				// Already loaded
 			}
-			else if (variable.second.size >= 0x10000 || variable.second.align >= 0x10000)
-			{
-				variable.second.addr = vm::alloc(variable.second.size, vm::main, std::max<u32>(variable.second.align, 0x10000));
-			}
 			else
 			{
-				const u32 next = utils::align(alloc_addr, variable.second.align);
-				const u32 end = next + variable.second.size - 1;
-
-				if (!next || (end >> 16 != alloc_addr >> 16))
-				{
-					alloc_addr = vm::alloc(0x10000, vm::main);
-				}
-				else
-				{
-					alloc_addr = next;
-				}
-
-				variable.second.addr = alloc_addr;
-				alloc_addr += variable.second.size;
+				hle_vars_offset = utils::align(hle_vars_offset, variable.second.align);
+				variable.second.addr = hle_vars_addr + hle_vars_offset;
+				hle_vars_offset += variable.second.size;
 			}
 
 			*variable.second.var = variable.second.addr;
