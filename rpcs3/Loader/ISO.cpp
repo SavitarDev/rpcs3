@@ -1013,7 +1013,16 @@ iso_archive::iso_archive(const std::string& path)
 	{
 		const auto descriptor_start = iso_file.pos();
 
-		descriptor_type = iso_file.read<u8>();
+		// This walk starts at sector 0 and ends at the terminator, so it crosses the system area
+		// before it reaches the descriptors ECMA-119 puts at sector 16. On a PlayStation 1 medium
+		// four of the sectors it crosses on the way are Mode 2 Form 2 and hold no 2048 byte user
+		// data, and no drive hands those over as plain data: sector 12 is where this disc stops
+		// answering, and the walk has to end there rather than take the emulator down.
+		if (!iso_file.read(descriptor_type, fs::pod_tag))
+		{
+			iso_log.notice("iso_archive: the disc reads no further than 0x%x", descriptor_start);
+			break;
+		}
 
 		// 1 = primary vol descriptor, 2 = joliet SVD
 		if (descriptor_type == 1 || descriptor_type == 2)

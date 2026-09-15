@@ -409,6 +409,20 @@ namespace fs
 	}
 
 #ifdef _WIN32
+	// A raw read the drive turns down is a fact about the medium, not a mistake by the caller. The
+	// four sectors before the ISO descriptors of a PlayStation 1 disc are Mode 2 Form 2 and hold no
+	// 2048 byte user data to hand over, so the driver answers ERROR_INVALID_FUNCTION for them - and
+	// only for them: reading this disc sector by sector, LBA 12 to 15 answer that way and every
+	// other sector reads normally. Every caller already copes with a read cut short, because that is
+	// what the end of a file looks like, so end it there rather than taking the emulator down.
+	//
+	// Asked only of a device, and only for the one error a device was seen to give. On a file it
+	// would mean something else, and every error still unaccounted for keeps failing loudly.
+	static bool read_ends_here(DWORD error, bool raw_device)
+	{
+		return error == ERROR_HANDLE_EOF || (raw_device && error == ERROR_INVALID_FUNCTION);
+	}
+
 	class windows_file final : public file_base
 	{
 		HANDLE m_handle;
@@ -480,7 +494,7 @@ namespace fs
 				const u64 pos = m_pos;
 				ovl.Offset = DWORD(pos);
 				ovl.OffsetHigh = DWORD(pos >> 32);
-				ensure(ReadFile(m_handle, data, size, &nread, &ovl) || GetLastError() == ERROR_HANDLE_EOF); // "file::read"
+				ensure(ReadFile(m_handle, data, size, &nread, &ovl) || read_ends_here(GetLastError(), m_raw_device)); // "file::read"
 				nread_sum += nread;
 				m_pos += nread;
 
@@ -508,7 +522,7 @@ namespace fs
 				OVERLAPPED ovl{};
 				ovl.Offset = DWORD(offset);
 				ovl.OffsetHigh = DWORD(offset >> 32);
-				ensure(ReadFile(m_handle, data, size, &nread, &ovl) || GetLastError() == ERROR_HANDLE_EOF); // "file::read"
+				ensure(ReadFile(m_handle, data, size, &nread, &ovl) || read_ends_here(GetLastError(), m_raw_device)); // "file::read"
 				nread_sum += nread;
 
 				if (nread < size)
