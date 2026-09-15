@@ -389,6 +389,16 @@ public:
 	shared_mutex mutex{};
 	atomic_t<u8> init = 0;
 
+	// The process whose memory the port buffers live in. Guest memory is reached through a
+	// mapping this build keeps per host thread, and only threads belonging to a process are given
+	// one, so a thread that belongs to none has to be told whose memory to borrow. An RSX context
+	// records the same thing for the same reason, in lv2_rsx_context::belonging_process.
+	//
+	// Atomic where the RSX one is not: a context belongs to the process that created it for as
+	// long as it exists, while this is written by whichever process calls cellAudioInit and read
+	// by the audio thread as it runs.
+	atomic_t<u32> belonging_process = 0;
+
 	u32 key_count = 0;
 	u8 event_period = 0;
 	std::array<u64, MAX_AUDIO_EVENT_QUEUES> event_sources{};

@@ -407,6 +407,10 @@ cell_audio_thread::cell_audio_thread(utils::serial& ar)
 	}
 
 	ar(ports);
+
+	// Not carried in the savestate, because it is not a property of the audio state: it is which
+	// process that state belongs to, and that is the process being restored around this call.
+	belonging_process = id_manager::g_process;
 }
 
 void cell_audio_thread::save(utils::serial& ar)
@@ -737,6 +741,44 @@ void cell_audio_thread::operator()()
 		{
 			m_audio_should_restart = true;
 			ringbuffer->flush();
+			thread_ctrl::wait_for(10000);
+			continue;
+		}
+
+		// Everything below reads, zeroes and tags the port buffers and writes each port's read
+		// index back, all of it in guest memory. The RSX thread reaches guest memory by taking the
+		// memory of the process its context belongs to once, when it binds to that context, because
+		// the context belongs to one process for as long as the thread runs. This thread cannot do
+		// that: it is started before any process has called cellAudioInit, and the process that
+		// does can quit and be replaced by another while it runs. So it borrows for the iteration
+		// and gives back at the end of it, and a process that goes away is simply not borrowed from
+		// again.
+		//
+		// Found and borrowed under the ID lock: between finding the process and borrowing from it
+		// the process can be taken away, and borrowing from one that is gone is fatal.
+		const auto vm_globals = [&]() -> std::shared_ptr<void>
+		{
+			reader_lock lock(id_manager::g_mutex);
+
+			const u32 owner = belonging_process;
+
+			if (!owner || !idm::get_unlocked<lv2_obj, lv2_process>(idm::id_index{owner, nullptr}))
+			{
+				return nullptr;
+			}
+
+			return lv2_process::acquire_globals(owner);
+		}();
+
+		if (!vm_globals && init)
+		{
+			// Audio is running, so a port may be started and the loop below would reach into memory
+			// it cannot see. Time is not advanced either: handing a game a read index for a block
+			// that was never mixed is worse than handing it none.
+			//
+			// Waited out the same way the paused case above waits: there is no work to come back
+			// early for, because a process that has gone will not produce audio however soon this
+			// thread looks again.
 			thread_ctrl::wait_for(10000);
 			continue;
 		}
@@ -1213,6 +1255,10 @@ error_code cellAudioInit()
 	}
 
 	g_audio.init = 1;
+
+	// Taken from the caller, the way an RSX context takes it in sys_rsx_context_allocate: this is
+	// the process the ports opened from here will point into.
+	g_audio.belonging_process = id_manager::g_process;
 
 	return CELL_OK;
 }
