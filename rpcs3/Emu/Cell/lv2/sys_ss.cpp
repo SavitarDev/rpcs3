@@ -5,6 +5,7 @@
 #include "Emu/IdManager.h"
 #include "Emu/Cell/timers.hpp"
 #include "Emu/Cell/PPUThread.h"
+#include "Emu/Cell/Modules/cellSysutil.h"
 #include "Emu/system_config.h"
 #include "util/sysinfo.hpp"
 
@@ -224,6 +225,43 @@ error_code sys_ss_get_open_psid(vm::ptr<CellSsOpenPSID> psid)
 	return CELL_OK;
 }
 
+// The region the console declares about itself, which is the target ID a firmware update for it
+// carries. The VSH reads it here and hands it to the PlayStation 1 and 2 emulators as their region
+// argument, and that argument decides whether a disc of a given region plays at all.
+//
+// Asked of the console region the emulator is configured as, so this and cellSysutilGetLicenseArea
+// describe one machine rather than two.
+//
+// The identifiers are the firmware's own. ps1_emu carries the table it reads them with, sixteen
+// characters at 0x150280 indexed by the target ID less 0x80, and answers J, A or E for the three
+// regions a PlayStation 1 disc comes in: J for 0x83 Japan, 0x86 Korea, 0x8A south Asia, 0x8B Taiwan,
+// 0x8D China and 0x8E Hong Kong, A for 0x84 USA and 0x88 Mexico, E for 0x85 Europe, 0x87 the UK,
+// 0x89 Australia and 0x8C Russia. It refuses anything at or below 0x82. It prints what it worked
+// out as "REGION NUM = 0x%08x code=%c", and 0x84 printing A and 0x85 printing E were both read off
+// a run of it.
+//
+// So each area below only has to land in the right one of the three. SCEH covers Hong Kong, Taiwan
+// and south east Asia, which the table answers alike.
+u8 get_ps_code_target_id()
+{
+	const CellSysutilLicenseArea license_area = g_cfg.sys.license_area;
+
+	switch (license_area)
+	{
+	case CELL_SYSUTIL_LICENSE_AREA_J: return 0x83; // Japan
+	case CELL_SYSUTIL_LICENSE_AREA_A: return 0x84; // USA
+	case CELL_SYSUTIL_LICENSE_AREA_E: return 0x85; // Europe
+	case CELL_SYSUTIL_LICENSE_AREA_K: return 0x86; // Korea
+	case CELL_SYSUTIL_LICENSE_AREA_C: return 0x8D; // China
+	case CELL_SYSUTIL_LICENSE_AREA_H: return 0x8E; // Hong Kong
+	default: break;
+	}
+
+	// No console is sold as "other". Left at the value this was fixed at before it was asked of the
+	// configuration, so an area that names no region answers as it always did.
+	return 0x85;
+}
+
 error_code sys_ss_appliance_info_manager(u32 code, vm::ptr<u8> buffer)
 {
 	sys_ss.notice("sys_ss_appliance_info_manager(code=0x%x, buffer=*0x%x)", code, buffer);
@@ -265,7 +303,11 @@ error_code sys_ss_appliance_info_manager(u32 code, vm::ptr<u8> buffer)
 	case 0x19004:
 	{
 		// AIM_get_ps_code
-		constexpr u8 pscode[] = { 0x00, 0x01, 0x00, 0x85, 0x00, 0x07, 0x00, 0x04 };
+		//
+		// Byte 3 is the console's region. The rest is left as it was: nothing here reads it, so
+		// there is nothing to say about it that was not already being said.
+		u8 pscode[] = { 0x00, 0x01, 0x00, 0x85, 0x00, 0x07, 0x00, 0x04 };
+		pscode[3] = get_ps_code_target_id();
 		std::memcpy(buffer.get_ptr(), pscode, 8);
 		break;
 	}

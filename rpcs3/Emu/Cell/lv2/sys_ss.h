@@ -21,6 +21,10 @@ struct CellSsOpenPSID
 
 class ppu_thread;
 
+// The console's own region, as the PS Code reports it. This is the number the firmware hands
+// the PlayStation 1 and 2 emulators to tell them which console they are running on.
+u8 get_ps_code_target_id();
+
 error_code sys_ss_random_number_generator(u64 pkg_id, vm::ptr<void> buf, u64 size);
 error_code sys_ss_access_control_engine(u64 pkg_id, u64 a2, u64 a3);
 error_code sys_ss_get_console_id(vm::ptr<u8> buf);
