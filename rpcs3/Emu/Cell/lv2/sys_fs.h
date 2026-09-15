@@ -170,6 +170,13 @@ std::string get_dev_ps2disc_path();
 // disc, "BOOT" for a PlayStation 1 one, empty when the folder holds neither.
 std::string get_dev_ps2disc_boot_key();
 
+// The same question asked of any folder, which is how a disc is recognized before it is staged.
+std::string get_disc_boot_key(const std::string& path);
+
+// Names the medium this boot was pointed at, which is what the drive, the mount point and the disc
+// reader then read. Pass an empty path for a boot that named none, leaving dev_ps2disc to answer.
+void set_boot_medium_path(std::string path);
+
 struct lv2_fs_mount_info
 {
 	lv2_fs_mount_point* const mp;

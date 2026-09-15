@@ -33,21 +33,47 @@ lv2_fs_mount_point g_mp_sys_dev_root{"/", "CELL_FS_ADMINFS", "CELL_FS_ADMINFS:",
 lv2_fs_mount_point g_mp_sys_no_device{};
 lv2_fs_mount_info  g_mi_sys_not_found{}; // wrapper for &g_mp_sys_no_device
 
+// The medium this boot was pointed at. Booting a disc from the game list names the medium at that
+// moment, and the drive, the mount point and the disc reader all have to agree on which one it is.
+//
+// Empty for every other boot, and then dev_ps2disc answers instead - that mount point is the VSH's
+// way of finding a medium, and a boot that named its own has no business asking it.
+//
+// Written only while a boot is being set up, which is before there is a guest thread to read it,
+// and read only afterwards. Every boot writes it, so a disc named once cannot outlive its run.
+static std::string g_boot_medium_path;
+
+void set_boot_medium_path(std::string path)
+{
+	if (!path.empty() && path.back() != '/' && path.back() != '\\')
+	{
+		path += '/';
+	}
+
+	g_boot_medium_path = std::move(path);
+}
+
 std::string get_dev_ps2disc_path()
 {
+	if (!g_boot_medium_path.empty())
+	{
+		return g_boot_medium_path;
+	}
+
 	return g_cfg_vfs.get(g_cfg_vfs.dev_ps2disc, rpcs3::utils::get_emu_dir());
 }
 
-std::string get_dev_ps2disc_boot_key()
+std::string get_disc_boot_key(const std::string& path)
 {
-	const std::string path = get_dev_ps2disc_path();
-
 	if (path.empty())
 	{
 		return {};
 	}
 
-	const fs::file cnf(path + "SYSTEM.CNF");
+	// Asked of a folder as readily as of a mount point, so the separator is settled here instead of
+	// by every caller.
+	const bool ends_with_separator = path.back() == '/' || path.back() == '\\';
+	const fs::file cnf(path + (ends_with_separator ? "" : "/") + "SYSTEM.CNF");
 
 	if (!cnf)
 	{
@@ -85,6 +111,11 @@ std::string get_dev_ps2disc_boot_key()
 	}
 
 	return key;
+}
+
+std::string get_dev_ps2disc_boot_key()
+{
+	return get_disc_boot_key(get_dev_ps2disc_path());
 }
 
 // True when dev_ps2disc holds a PlayStation 1 or PlayStation 2 disc.
