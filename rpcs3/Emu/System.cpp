@@ -24,6 +24,9 @@
 #include "Emu/Cell/lv2/sys_prx.h"
 #include "Emu/Cell/lv2/sys_overlay.h"
 #include "Emu/Cell/lv2/sys_spu.h"
+#include "Emu/Cell/lv2/sys_fs.h"
+#include "Emu/Cell/lv2/sys_storage.h"
+#include "Emu/Cell/lv2/sys_ss.h"
 #include "Emu/Cell/Modules/cellGame.h"
 #include "Emu/Cell/Modules/cellSysutil.h"
 
@@ -1551,7 +1554,24 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 		}
 
 		const std::string resolved_path = GetCallbacks().resolve_path(m_path);
-		if (!launching_from_disc_archive && is_iso_file(m_path))
+		// A PlayStation 1 disc carries no PARAM.SFO to be recognized by. What it carries is
+		// SYSTEM.CNF at its root with a BOOT line naming its executable, which is the same file and
+		// the same key the firmware tells one medium from another by. The key is compared whole
+		// rather than looked for: a PlayStation 2 disc names its executable on a BOOT2 line and is
+		// run by a different emulator, so only BOOT is this one.
+		//
+		// Asked before anything is made of the path, because what follows is written around a
+		// PlayStation 3 disc and would take this one for one.
+		const bool booting_ps1_disc = fs::is_dir(m_path) && get_disc_boot_key(m_path) == "BOOT";
+
+		// The medium for this run is the one that was selected, not whatever dev_ps2disc happens to
+		// hold: that mount point belongs to the VSH. Cleared for every other boot.
+		set_boot_medium_path(booting_ps1_disc ? m_path : std::string{});
+
+		// A PlayStation 1 disc is a valid ISO 9660 and would be taken for a disc image here. That
+		// shape belongs to a PlayStation 3 disc: this one is read through the drive by the emulator
+		// booted for it, and mounting it as an archive puts a virtual device in the way of that.
+		if (!launching_from_disc_archive && !booting_ps1_disc && is_iso_file(m_path))
 		{
 			sys_log.notice("Loading iso archive '%s'", m_path);
 
@@ -1800,7 +1820,11 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 		}
 
 		// Special boot mode (directory scan)
-		if (!launching_from_disc_archive && fs::is_dir(m_path))
+		//
+		// Not for a disc. This walks a folder compiling every PlayStation 3 module it finds, and a
+		// medium handed to an emulator is neither a folder of those nor something to compile: it is
+		// read through the drive by the emulator that was booted for it.
+		if (!launching_from_disc_archive && !booting_ps1_disc && fs::is_dir(m_path))
 		{
 			m_state = system_state::ready;
 			GetCallbacks().on_ready();
@@ -2112,6 +2136,61 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 				}
 			}
 		}
+		else if (booting_ps1_disc)
+		{
+			// A PlayStation 1 disc is run by ps1_emu, which is the emulator the disc path needs: the
+			// newemu the Classics below are run by reads its game from a folder, while this one reads
+			// a real disc through the drive. Everything it needs about that disc it asks the drive
+			// for, so nothing here names the medium - staging it is what names it.
+			//
+			// The arguments are the ones the VSH spawns it with. ps1_emu prints its own argc and
+			// argv to the TTY as it starts, so what the VSH passed was read straight off a run of
+			// it: argc=7, two internal memory cards by name, a region, and three numbers. It prints
+			// the last two back as g_nUpconvertMode and g_bImageSmoothing, which is how those are
+			// known.
+			//
+			// The first of the three is an idle timeout in seconds. ps1_emu does not read it: it keeps
+			// it aside and hands it back in the same place when it spawns ps1_netemu.self, which is
+			// what reads it. There it is parsed as decimal, defaults to 1800 when absent, is raised to
+			// 60 when it falls between 1 and 59, and is then multiplied by 50 or by 60 - the two field
+			// rates - to give a limit in frames. A counter runs against that limit from the moment the
+			// menu opens. So 1200 is twenty minutes, and it is passed as the VSH passes it.
+			//
+			// The cards are named, not chosen. The VSH passes whichever card the XMB has assigned to
+			// each slot: explore_plugin keeps a type, a slot and a port per card, and game_ext_plugin
+			// picks the extension from a two entry table, VM1 for a PlayStation 1 card and VM2 for a
+			// PlayStation 2 one. There is no XMB on this path and so nothing has been assigned, and a
+			// PlayStation 1 disc takes PlayStation 1 cards: both slots are named VM1.
+			//
+			// ps1_emu handles no other kind. It carries one card path, "/dev_hdd0/savedata/vmc/%s.VM1",
+			// and a run of it given a VM2 card for slot 2 answered
+			// "_xMcThread: *** cellFsOpen Failed. err = 80010006", where two VM1 cards open as
+			// 128 KB files and no such line appears.
+			sys_log.notice("PS1 Disc: %s", m_path);
+
+			// The region is the console's own, not the disc's: the VSH passes what the machine is,
+			// and ps1_emu reads the serial off the disc separately - it answers "North American
+			// Title detected!" to an SLUS one whatever it was told here.
+			//
+			// It decides whether the disc plays at all. Told Europe with an American disc, ps1_emu
+			// never gets past the front of the medium: it rereads LBA 0x04 to 0x1C without end, 863
+			// READ CD commands over 35 passes of the same 25 sectors before the boot was given up on.
+			// Told USA, the same disc boots. A console plays the PlayStation 1 discs of its own
+			// region and no others, and this argument is where that is settled.
+			//
+			// Asked of the PS Code, which is where the VSH reads it and so the only place this can
+			// be read from without the two disagreeing. ps1_emu prints back what it was given as
+			// "REGION NUM = 0x%08x code=%c": 0x84 prints A and 0x85 prints E, both read off this
+			// emulator. It parses the argument as hexadecimal.
+			argv.resize(7);
+			argv[0] = "/dev_flash/ps1emu/ps1_emu.self";
+			argv[1] = "Internal Memory Card.VM1";  // virtual mc 1, /dev_hdd0/savedata/vmc/%argv[1]%
+			argv[2] = "Internal Memory Card2.VM1"; // virtual mc 2, /dev_hdd0/savedata/vmc/%argv[2]%
+			argv[3] = fmt::format("%04x", get_ps_code_target_id());
+			argv[4] = "1200";                      // idle timeout in seconds, read by ps1_netemu
+			argv[5] = "0";                         // g_nUpconvertMode
+			argv[6] = "0";                         // g_bImageSmoothing
+		}
 		else if (m_cat == "1P" && from_hdd0_game)
 		{
 			// PS1 Classic located in dev_hdd0/game
@@ -2387,7 +2466,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 		// Open SELF or ELF
 		std::string elf_path = m_path;
 
-		if (m_cat == "1P" || m_cat == "PE")
+		if (m_cat == "1P" || m_cat == "PE" || booting_ps1_disc)
 		{
 			// Use emulator path
 			elf_path = vfs::get(argv[0]);
@@ -2607,6 +2686,16 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 
 			if (std::vector<u8> paramsfo_dummy; ppu_load_self(ppu_exec, null_ptr, false, this->argv, this->envp, this->data, paramsfo_dummy, DeserialManager()))
 			{
+				// The tray, read here because here is the first place there is a machine to hold it:
+				// the executable just loaded is what brought the global objects up, and the drive is
+				// one of them. Still ahead of the first instruction the guest runs, which matters
+				// because ps1_emu asks the drive for a sector almost as soon as it starts, and a
+				// medium that has not been read answers the way an empty tray would.
+				if (booting_ps1_disc)
+				{
+					sys_storage_stage_boot_medium();
+				}
+
 				if (g_cfg.core.ppu_debug && had_been_decrypted)
 				{
 					// Auto-dump decrypted binaries if PPU debug is enabled
