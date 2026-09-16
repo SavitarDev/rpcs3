@@ -109,12 +109,12 @@ public:
 
 	usb_handler_thread(utils::serial& ar) : usb_handler_thread()
 	{
-		is_init = !!ar.pop<u8>();
+		open_handles = ar.pop<u8>();
 	}
 
 	void save(utils::serial& ar)
 	{
-		ar(u8{is_init.load()});
+		ar(narrow<u8>(open_handles.load()));
 	}
 
 	// Thread loop
@@ -153,7 +153,11 @@ public:
 	std::map<u8, std::pair<input::product_type, std::shared_ptr<usb_device>>> pad_to_usb;
 
 	shared_mutex mutex;
-	atomic_t<bool> is_init = false;
+	// How many handles are out. lv2 hands one to every caller that asks, which is what the
+	// assertion below used to say cellUsbd never does: one library in one process opens one
+	// handle. Two processes are two callers, and the bus is up for as long as either of them is
+	// holding what it was given.
+	atomic_t<u32> open_handles = 0;
 
 	// sys_usbd_receive_event PPU Threads
 	shared_mutex mutex_sq;
@@ -309,7 +313,7 @@ void LIBUSB_CALL callback_transfer(struct libusb_transfer* transfer)
 {
 	auto& usbh = g_fxo->get<named_thread<usb_handler_thread>>();
 
-	if (!usbh.is_init)
+	if (!usbh.open_handles)
 		return;
 
 	usbh.transfer_complete(transfer);
@@ -1138,8 +1142,10 @@ error_code sys_usbd_initialize(ppu_thread& ppu, vm::ptr<u32> handle)
 	{
 		std::lock_guard lock(usbh.mutex);
 
-		// Must not occur (lv2 allows multiple handles, cellUsbd does not)
-		ensure(!usbh.is_init.exchange(true));
+		// One more holder of the bus. This was an assertion while there was one process to ask:
+		// cellUsbd opens a single handle, so a second one meant the library had been initialized
+		// twice and that was worth catching. A second process asking is not that.
+		usbh.open_handles++;
 	}
 
 	ppu.check_state();
@@ -1158,7 +1164,14 @@ error_code sys_usbd_finalize(ppu_thread& ppu, u32 handle)
 	auto& usbh = g_fxo->get<named_thread<usb_handler_thread>>();
 
 	std::lock_guard lock(usbh.mutex);
-	usbh.is_init = false;
+
+	// Only the handle this caller was given. Waking the waiters and tearing the bus down is for
+	// the last one back, because everything below is shared and whoever still holds a handle is
+	// still entitled to it.
+	if (!usbh.open_handles || --usbh.open_handles)
+	{
+		return CELL_OK;
+	}
 
 	// Forcefully awake all waiters
 	while (auto cpu = lv2_obj::schedule<ppu_thread>(usbh.sq, SYS_SYNC_FIFO))
@@ -1183,7 +1196,7 @@ error_code sys_usbd_get_device_list(ppu_thread& ppu, u32 handle, vm::ptr<UsbInte
 	auto& usbh = g_fxo->get<named_thread<usb_handler_thread>>();
 
 	std::lock_guard lock(usbh.mutex);
-	if (!usbh.is_init)
+	if (!usbh.open_handles)
 		return CELL_EINVAL;
 
 	// TODO: was std::min<s32>
@@ -1210,7 +1223,7 @@ error_code sys_usbd_register_extra_ldd(ppu_thread& ppu, u32 handle, vm::cptr<cha
 	auto& usbh = g_fxo->get<named_thread<usb_handler_thread>>();
 
 	std::lock_guard lock(usbh.mutex);
-	if (!usbh.is_init)
+	if (!usbh.open_handles)
 		return CELL_EINVAL;
 
 	std::string_view product{s_product.get_ptr(), slen_product};
@@ -1230,7 +1243,7 @@ error_code sys_usbd_unregister_extra_ldd(ppu_thread& ppu, u32 handle, vm::cptr<c
 	auto& usbh = g_fxo->get<named_thread<usb_handler_thread>>();
 
 	std::lock_guard lock(usbh.mutex);
-	if (!usbh.is_init)
+	if (!usbh.open_handles)
 		return CELL_EINVAL;
 
 	std::string_view product{s_product.get_ptr(), slen_product};
@@ -1251,7 +1264,7 @@ error_code sys_usbd_get_descriptor_size(ppu_thread& ppu, u32 handle, u32 device_
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init || !usbh.handled_devices.count(device_handle))
+	if (!usbh.open_handles || !usbh.handled_devices.count(device_handle))
 	{
 		return CELL_EINVAL;
 	}
@@ -1274,7 +1287,7 @@ error_code sys_usbd_get_descriptor(ppu_thread& ppu, u32 handle, u32 device_handl
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init || !usbh.handled_devices.count(device_handle))
+	if (!usbh.open_handles || !usbh.handled_devices.count(device_handle))
 	{
 		return CELL_EINVAL;
 	}
@@ -1337,7 +1350,7 @@ error_code sys_usbd_open_pipe(ppu_thread& ppu, u32 handle, u32 device_handle, u3
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init || !usbh.handled_devices.count(device_handle))
+	if (!usbh.open_handles || !usbh.handled_devices.count(device_handle))
 	{
 		return CELL_EINVAL;
 	}
@@ -1355,7 +1368,7 @@ error_code sys_usbd_open_default_pipe(ppu_thread& ppu, u32 handle, u32 device_ha
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init || !usbh.handled_devices.count(device_handle))
+	if (!usbh.open_handles || !usbh.handled_devices.count(device_handle))
 	{
 		return CELL_EINVAL;
 	}
@@ -1373,7 +1386,7 @@ error_code sys_usbd_close_pipe(ppu_thread& ppu, u32 handle, u32 pipe_handle)
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init || !usbh.is_pipe(pipe_handle))
+	if (!usbh.open_handles || !usbh.is_pipe(pipe_handle))
 	{
 		return CELL_EINVAL;
 	}
@@ -1400,7 +1413,7 @@ error_code sys_usbd_receive_event(ppu_thread& ppu, u32 handle, vm::ptr<u64> arg1
 	{
 		std::lock_guard lock_sq(usbh.mutex_sq);
 
-		if (!usbh.is_init)
+		if (!usbh.open_handles)
 			return CELL_EINVAL;
 
 		if (usbh.get_event(arg1, arg2, arg3))
@@ -1490,7 +1503,7 @@ error_code sys_usbd_transfer_data(ppu_thread& ppu, u32 handle, u32 id_pipe, vm::
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init || !usbh.is_pipe(id_pipe))
+	if (!usbh.open_handles || !usbh.is_pipe(id_pipe))
 	{
 		return CELL_EINVAL;
 	}
@@ -1568,7 +1581,7 @@ error_code sys_usbd_isochronous_transfer_data(ppu_thread& ppu, u32 handle, u32 i
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init || !usbh.is_pipe(id_pipe))
+	if (!usbh.open_handles || !usbh.is_pipe(id_pipe))
 	{
 		return CELL_EINVAL;
 	}
@@ -1605,7 +1618,7 @@ error_code sys_usbd_get_transfer_status(ppu_thread& ppu, u32 handle, u32 id_tran
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init || id_transfer >= MAX_SYS_USBD_TRANSFERS)
+	if (!usbh.open_handles || id_transfer >= MAX_SYS_USBD_TRANSFERS)
 		return CELL_EINVAL;
 
 	const auto status = usbh.get_transfer_status(id_transfer);
@@ -1625,7 +1638,7 @@ error_code sys_usbd_get_isochronous_transfer_status(ppu_thread& ppu, u32 handle,
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init || id_transfer >= MAX_SYS_USBD_TRANSFERS)
+	if (!usbh.open_handles || id_transfer >= MAX_SYS_USBD_TRANSFERS)
 		return CELL_EINVAL;
 
 	const auto status = usbh.get_isochronous_transfer_status(id_transfer);
@@ -1646,7 +1659,7 @@ error_code sys_usbd_get_device_location(ppu_thread& ppu, u32 handle, u32 device_
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init || !usbh.handled_devices.count(device_handle))
+	if (!usbh.open_handles || !usbh.handled_devices.count(device_handle))
 		return CELL_EINVAL;
 
 	usbh.handled_devices[device_handle].second->get_location(location.get_ptr());
@@ -1672,7 +1685,7 @@ error_code sys_usbd_event_port_send(ppu_thread& ppu, u32 handle, u64 arg1, u64 a
 
 	std::lock_guard lock(usbh.mutex);
 
-	if (!usbh.is_init)
+	if (!usbh.open_handles)
 		return CELL_EINVAL;
 
 	usbh.add_event(arg1, arg2, arg3);
