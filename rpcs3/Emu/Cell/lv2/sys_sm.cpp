@@ -4,6 +4,7 @@
 #include "Emu/Cell/ErrorCodes.h"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/lv2/sys_process.h"
+#include "Emu/Cell/lv1/lv1.h"
 
 #include "sys_sm.h"
 
@@ -107,8 +108,28 @@ error_code sys_sm_shutdown(ppu_thread& ppu, u16 op, vm::ptr<void> param, u64 siz
 		lv2_exitspawn(ppu, true, null_ptr, Emu.argv, Emu.envp, Emu.data, *std::make_unique<std::vector<u8>>());
 		break;
 	}
-	case 0x8201:
 	case 0x8202:
+	{
+		// Boot the PlayStation 2 emulator: vsh passes the 0x4f0 bytes of its PS2 boot parameters
+		// (/dev_hdd0/tmp/game/ps2bootparam.dat's first block: settings, title id, upscaler and smoothing, ...,
+		// vsh 0xd4e24), which lv2 hands to lparmgr as the inter-lpar parameter (lparmgr keeps at most 0x600
+		// bytes, lv1 process 1 0x8001b708) before the partition is rebooted. The CECHA01's emulator is
+		// ps2_emu.self, the one that drives the PS2 chips (psdevwiki PS2_Emulation).
+		if (!param || size > 0x600)
+		{
+			fmt::throw_exception("sys_sm_shutdown(0x8202): a parameter of 0x%x bytes at *0x%x is not implemented", size, param);
+		}
+
+		sys_sm.success("Received PS2 emulator boot request (parameter of 0x%x bytes)", size);
+		lv1_set_inter_lpar_parameter({static_cast<const u8*>(param.get_ptr()), size});
+
+		std::vector<std::string> argv{"/dev_flash/ps2emu/ps2_emu.self"};
+		std::vector<std::string> envp;
+		std::vector<u8> data;
+		lv2_exitspawn(ppu, true, null_ptr, argv, envp, data, *std::make_unique<std::vector<u8>>());
+		break;
+	}
+	case 0x8201:
 	case 0x8204:
 	{
 		sys_sm.warning("Unsupported LPAR operation: 0x%x", op);
