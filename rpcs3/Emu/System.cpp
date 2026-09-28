@@ -27,6 +27,7 @@
 #include "Emu/Cell/lv2/sys_fs.h"
 #include "Emu/Cell/lv2/sys_storage.h"
 #include "Emu/Cell/lv2/sys_ss.h"
+#include "Emu/Cell/lv1/lv1.h"
 #include "Emu/Cell/Modules/cellGame.h"
 #include "Emu/Cell/Modules/cellSysutil.h"
 
@@ -2508,6 +2509,9 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 
 		SelfAdditionalInfo self_info{};
 
+		// Set when the executable is an operating system lv1 boots in place of the GameOS kernel
+		bool booting_guest_os = false;
+
 		// Check SELF header
 		if (elf_file.size() >= 4 && elf_file.read<u32>() == "SCE\0"_u32)
 		{
@@ -2684,7 +2688,18 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 				sys_log.error("Booting HG category outside of HDD0!");
 			}
 
-			if (std::vector<u8> paramsfo_dummy; ppu_load_self(ppu_exec, null_ptr, false, this->argv, this->envp, this->data, paramsfo_dummy, DeserialManager()))
+			// The PlayStation 2 emulators are not processes: lv1 unloads the GameOS and boots them as the
+			// operating system of the partition, with no lv2 underneath to load modules or pass arguments.
+			booting_guest_os = self_info.valid && lv1_is_guest_os(self_info.prog_id_hdr.program_authority_id, self_info.prog_id_hdr.program_type);
+
+			if (booting_guest_os)
+			{
+				if (!lv1_load_guest_os(ppu_exec, argv[0]))
+				{
+					ppu_exec.set_error(elf_error::header_type);
+				}
+			}
+			else if (std::vector<u8> paramsfo_dummy; ppu_load_self(ppu_exec, null_ptr, false, this->argv, this->envp, this->data, paramsfo_dummy, DeserialManager()))
 			{
 				// The tray, read here because here is the first place there is a machine to hold it:
 				// the executable just loaded is what brought the global objects up, and the drive is
@@ -2781,7 +2796,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			return game_boot_result::invalid_file_or_folder;
 		}
 
-		if (ppu_exec == elf_error::ok && !fs::is_file(g_cfg_vfs.get_dev_flash() + "sys/external/liblv2.sprx"))
+		if (ppu_exec == elf_error::ok && !booting_guest_os && !fs::is_file(g_cfg_vfs.get_dev_flash() + "sys/external/liblv2.sprx"))
 		{
 			const auto& libs = g_cfg.core.libraries_control.get_set();
 
