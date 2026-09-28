@@ -10,6 +10,7 @@
 #include "Emu/Cell/PPUAnalyser.h"
 #include "Emu/Cell/PPUFunction.h"
 #include "Emu/Cell/timers.hpp"
+#include "Emu/Cell/lv1/lv1.h"
 #include "Emu/IdManager.h"
 
 #include <bit>
@@ -52,6 +53,29 @@ void ppubreak(ppu_thread& ppu)
 #define PPU_WRITE_32(addr, value) vm::write32(addr, value);
 #define PPU_WRITE_64(addr, value) vm::write64(addr, value);
 #endif
+
+// The emulator address of a data access. A GameOS process addresses its memory by effective address; a
+// supervisor thread (an lv1 guest operating system) goes through its MMU, which may raise a storage interrupt.
+static inline u32 ppu_ea(ppu_thread& ppu, u64 addr, u32 size, bool store)
+{
+	if (ppu.supervisor) [[unlikely]]
+	{
+		return ppu_supervisor_translate(ppu, addr, size, store);
+	}
+
+	return vm::cast(addr);
+}
+
+// The same, for the handlers that are not given the thread
+static inline u32 ppu_ea_current(u64 addr, u32 size, bool store)
+{
+	if (const auto ppu = cpu_thread::get_current<ppu_thread>(); ppu && ppu->supervisor) [[unlikely]]
+	{
+		return ppu_supervisor_translate(*ppu, addr, size, store);
+	}
+
+	return vm::cast(addr);
+}
 
 extern bool is_debugger_present();
 
@@ -449,11 +473,12 @@ void ppu_set_fpcc(ppu_thread& ppu, f64 a, f64 b, u64 cr_field = 1)
 
 // Validate read data in case does not match reservation
 template <typename T, ppu_exec_bit... Flags>
-auto ppu_feed_data(ppu_thread& ppu, u64 addr)
+auto ppu_feed_data(ppu_thread& ppu, u64 ea)
 {
 	static_assert(sizeof(T) <= 128, "Incompatible type-size, break down into smaller loads");
 
-	auto value = vm::_ref<T>(vm::cast(addr));
+	const u64 addr = ppu_ea(ppu, ea, sizeof(T), false);
+	auto value = vm::_ref<T>(static_cast<u32>(addr));
 
 #ifdef RPCS3_HAS_MEMORY_BREAKPOINTS
 	if (g_breakpoint_handler.HasBreakpoint(addr, breakpoint_types::bp_read))
@@ -3253,6 +3278,26 @@ auto SC()
 			const u32 old_cia = ppu.cia;
 			ppu.cia = vm::get_addr(this_op);
 			ppu.exec_bytes += ppu.cia - old_cia;
+
+			if (ppu.supervisor) [[unlikely]]
+			{
+				// An lv1 guest operating system: LEV=1 calls the hypervisor, and LEV=0 is a System Call
+				// interrupt the guest takes itself at 0xc00 (Book III v2.02 5.5.13)
+				if (op.opcode == ppu_instructions::SC(1))
+				{
+					// lv1 sets where the thread goes on: the next instruction, or its External interrupt
+					// vector when it delivers one on the way out
+					lv1_hypercall(ppu);
+					return;
+				}
+
+				if (op.opcode == ppu_instructions::SC(0))
+				{
+					ppu_supervisor_interrupt(ppu, 0xc00, vm::get_addr(this_op) + 4);
+					return;
+				}
+			}
+
 			if (op.opcode != ppu_instructions::SC(0))
 			{
 				fmt::throw_exception("Unknown/Illegal SC: 0x%08x", op.opcode);
@@ -3899,7 +3944,7 @@ auto LWARX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	ppu.gpr[op.rd] = ppu_lwarx(ppu, vm::cast(addr));
+	ppu.gpr[op.rd] = ppu_lwarx(ppu, ppu_ea(ppu, addr, 4, false));
 	};
 	RETURN_(ppu, op);
 }
@@ -4215,7 +4260,7 @@ auto LDARX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	ppu.gpr[op.rd] = ppu_ldarx(ppu, vm::cast(addr));
+	ppu.gpr[op.rd] = ppu_ldarx(ppu, ppu_ea(ppu, addr, 8, false));
 	};
 	RETURN_(ppu, op);
 }
@@ -4311,7 +4356,7 @@ auto STVEBX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	const u8 eb = addr & 0xf;
-	PPU_WRITE_8(vm::cast(addr), ppu.vr[op.vs]._u8[15 - eb]);
+	PPU_WRITE_8(ppu_ea(ppu, addr, 1, true), ppu.vr[op.vs]._u8[15 - eb]);
 	};
 	RETURN_(ppu, op);
 }
@@ -4418,7 +4463,7 @@ auto STDX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE_64(vm::cast(addr), ppu.gpr[op.rs]);
+	PPU_WRITE_64(ppu_ea(ppu, addr, 8, true), ppu.gpr[op.rs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -4431,7 +4476,7 @@ auto STWCX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	ppu_cr_set(ppu, 0, false, false, ppu_stwcx(ppu, vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs])), ppu.xer.so);
+	ppu_cr_set(ppu, 0, false, false, ppu_stwcx(ppu, ppu_ea(ppu, addr, 4, true), static_cast<u32>(ppu.gpr[op.rs])), ppu.xer.so);
 	};
 	RETURN_(ppu, op);
 }
@@ -4444,7 +4489,7 @@ auto STWX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE_32(vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs]));
+	PPU_WRITE_32(ppu_ea(ppu, addr, 4, true), static_cast<u32>(ppu.gpr[op.rs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -4458,7 +4503,7 @@ auto STVEHX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = (op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb]) & ~1ULL;
 	const u8 eb = (addr & 0xf) >> 1;
-	PPU_WRITE_16(vm::cast(addr), ppu.vr[op.vs]._u16[7 - eb]);
+	PPU_WRITE_16(ppu_ea(ppu, addr, 2, true), ppu.vr[op.vs]._u16[7 - eb]);
 	};
 	RETURN_(ppu, op);
 }
@@ -4471,7 +4516,7 @@ auto STDUX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
-	PPU_WRITE_64(vm::cast(addr), ppu.gpr[op.rs]);
+	PPU_WRITE_64(ppu_ea(ppu, addr, 8, true), ppu.gpr[op.rs]);
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -4485,7 +4530,7 @@ auto STWUX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
-	PPU_WRITE_32(vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs]));
+	PPU_WRITE_32(ppu_ea(ppu, addr, 4, true), static_cast<u32>(ppu.gpr[op.rs]));
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -4500,7 +4545,7 @@ auto STVEWX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = (op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb]) & ~3ULL;
 	const u8 eb = (addr & 0xf) >> 2;
-	PPU_WRITE_32(vm::cast(addr), ppu.vr[op.vs]._u32[3 - eb]);
+	PPU_WRITE_32(ppu_ea(ppu, addr, 4, true), ppu.vr[op.vs]._u32[3 - eb]);
 	};
 	RETURN_(ppu, op);
 }
@@ -4551,7 +4596,7 @@ auto STDCX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	ppu_cr_set(ppu, 0, false, false, ppu_stdcx(ppu, vm::cast(addr), ppu.gpr[op.rs]), ppu.xer.so);
+	ppu_cr_set(ppu, 0, false, false, ppu_stdcx(ppu, ppu_ea(ppu, addr, 8, true), ppu.gpr[op.rs]), ppu.xer.so);
 	};
 	RETURN_(ppu, op);
 }
@@ -4564,7 +4609,7 @@ auto STBX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE_8(vm::cast(addr), static_cast<u8>(ppu.gpr[op.rs]));
+	PPU_WRITE_8(ppu_ea(ppu, addr, 1, true), static_cast<u8>(ppu.gpr[op.rs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -4577,7 +4622,7 @@ auto STVX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = (op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb]) & ~0xfull;
-	PPU_WRITE(v128, vm::cast(addr), ppu.vr[op.vs]);
+	PPU_WRITE(v128, ppu_ea(ppu, addr, sizeof(v128), true), ppu.vr[op.vs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -4676,7 +4721,7 @@ auto STBUX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
-	PPU_WRITE_8(vm::cast(addr), static_cast<u8>(ppu.gpr[op.rs]));
+	PPU_WRITE_8(ppu_ea(ppu, addr, 1, true), static_cast<u8>(ppu.gpr[op.rs]));
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -4778,6 +4823,50 @@ auto XOR()
 	RETURN_(ppu, op);
 }
 
+// Supervisor SPRs of an lv1 guest operating system thread (Book III v2.02 Figure 17, Cell Broadband Engine
+// Registers 12.1.1 for CTRL), limited to the ones the guest images are known to use
+static bool ppu_supervisor_mfspr(ppu_thread& ppu, u32 spr, u64& value)
+{
+	auto& sv = *ppu.supervisor;
+
+	switch (spr)
+	{
+	case 18: value = sv.dsisr; return true; // DSISR
+	case 19: value = sv.dar; return true; // DAR
+	case 22: value = sv.read_dec(lv1_timebase()); return true; // DEC
+	case 26: value = sv.srr0; return true; // SRR0
+	case 27: value = sv.srr1; return true; // SRR1
+	case 136:
+	{
+		// CTRL: CT (bits 0:1) names the thread reading it, 0b10 for thread 0 and 0b01 for thread 1, and
+		// TE0/TE1 (bits 8:9) are set while the respective thread is enabled, which both are. RUN (bit 31) is
+		// left clear: its value in a running guest has not been determined and no guest code reads it.
+		value = (sv.hw_thread ? 0x40000000u : 0x80000000u) | 0x00c00000u;
+		return true;
+	}
+	case 272:
+	case 273:
+	case 274: value = sv.sprg[spr - 272]; return true; // SPRG0-SPRG2
+	default: return false;
+	}
+}
+
+static bool ppu_supervisor_mtspr(ppu_thread& ppu, u32 spr, u64 value)
+{
+	auto& sv = *ppu.supervisor;
+
+	switch (spr)
+	{
+	case 22: sv.write_dec(static_cast<u32>(value), lv1_timebase()); return true; // DEC
+	case 26: sv.srr0 = value; return true; // SRR0
+	case 27: sv.srr1 = value; return true; // SRR1
+	case 272:
+	case 273:
+	case 274: sv.sprg[spr - 272] = value; return true; // SPRG0-SPRG2
+	default: return false;
+	}
+}
+
 template <u32 Build, ppu_exec_bit... Flags>
 auto MFSPR()
 {
@@ -4794,9 +4883,18 @@ auto MFSPR()
 	case 0x009: ppu.gpr[op.rd] = ppu.ctr; break;
 	case 0x100: ppu.gpr[op.rd] = ppu.vrsave; break;
 
-	case 0x10C: ppu.gpr[op.rd] = get_timebased_time(); break;
-	case 0x10D: ppu.gpr[op.rd] = get_timebased_time() >> 32; break;
-	default: fmt::throw_exception("MFSPR 0x%x", n);
+	// A guest operating system reads its partition's timebase
+	case 0x10C: ppu.gpr[op.rd] = ppu.supervisor ? lv1_timebase() : get_timebased_time(); break;
+	case 0x10D: ppu.gpr[op.rd] = (ppu.supervisor ? lv1_timebase() : get_timebased_time()) >> 32; break;
+	default:
+	{
+		if (ppu.supervisor && ppu_supervisor_mfspr(ppu, n, ppu.gpr[op.rd]))
+		{
+			break;
+		}
+
+		fmt::throw_exception("MFSPR 0x%x", n);
+	}
 	}
 
 	};
@@ -4864,8 +4962,9 @@ auto MFTB()
 
 	switch (n)
 	{
-	case 0x10C: ppu.gpr[op.rd] = get_timebased_time(); break;
-	case 0x10D: ppu.gpr[op.rd] = get_timebased_time() >> 32; break;
+	// A guest operating system reads its partition's timebase
+	case 0x10C: ppu.gpr[op.rd] = ppu.supervisor ? lv1_timebase() : get_timebased_time(); break;
+	case 0x10D: ppu.gpr[op.rd] = (ppu.supervisor ? lv1_timebase() : get_timebased_time()) >> 32; break;
 	default: fmt::throw_exception("MFTB 0x%x", n);
 	}
 
@@ -4920,7 +5019,7 @@ auto STHX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE_16(vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
+	PPU_WRITE_16(ppu_ea(ppu, addr, 2, true), static_cast<u16>(ppu.gpr[op.rs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -4959,7 +5058,7 @@ auto STHUX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
-	PPU_WRITE_16(vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
+	PPU_WRITE_16(ppu_ea(ppu, addr, 2, true), static_cast<u16>(ppu.gpr[op.rs]));
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -5038,7 +5137,15 @@ auto MTSPR()
 	case 0x008: ppu.lr = ppu.gpr[op.rs]; break;
 	case 0x009: ppu.ctr = ppu.gpr[op.rs]; break;
 	case 0x100: ppu.vrsave = static_cast<u32>(ppu.gpr[op.rs]); break;
-	default: fmt::throw_exception("MTSPR 0x%x", n);
+	default:
+	{
+		if (ppu.supervisor && ppu_supervisor_mtspr(ppu, n, ppu.gpr[op.rs]))
+		{
+			break;
+		}
+
+		fmt::throw_exception("MTSPR 0x%x", n);
+	}
 	}
 
 	};
@@ -5078,7 +5185,7 @@ auto STVXL()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = (op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb]) & ~0xfull;
-	PPU_WRITE(v128, vm::cast(addr), ppu.vr[op.vs]);
+	PPU_WRITE(v128, ppu_ea(ppu, addr, sizeof(v128), true), ppu.vr[op.vs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -5351,7 +5458,7 @@ auto STVLX()
 	{
 		const u64 addr = op.ra ? a + b : b;
 		const u32 tail = u32(addr & 15);
-		u8* ptr = vm::_ptr<u8>(addr);
+		u8* ptr = vm::_ptr<u8>(ppu_ea_current(addr, 16 - tail, true));
 		for (u32 j = 0; j < 16 - tail; j++)
 			ptr[j] = s.u8r[j];
 	};
@@ -5367,7 +5474,7 @@ auto STDBRX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE(le_t<u64>, vm::cast(addr), ppu.gpr[op.rs]);
+	PPU_WRITE(le_t<u64>, ppu_ea(ppu, addr, sizeof(le_t<u64>), true), ppu.gpr[op.rs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -5383,7 +5490,7 @@ auto STSWX()
 	u32 count = ppu.xer.cnt & 0x7F;
 	for (; count >= 4; count -= 4, addr += 4, op.rs = (op.rs + 1) & 31)
 	{
-		PPU_WRITE_32(vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs]));
+		PPU_WRITE_32(ppu_ea(ppu, addr, 4, true), static_cast<u32>(ppu.gpr[op.rs]));
 	}
 	if (count)
 	{
@@ -5391,7 +5498,7 @@ auto STSWX()
 		for (u32 byte = 0; byte < count; byte++)
 		{
 			u8 byte_value = static_cast<u8>(value >> ((3 ^ byte) * 8));
-			PPU_WRITE_8(vm::cast(addr + byte), byte_value);
+			PPU_WRITE_8(ppu_ea(ppu, addr + byte, 1, true), byte_value);
 		}
 	}
 	};
@@ -5406,7 +5513,7 @@ auto STWBRX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE(le_t<u32>, vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs]));
+	PPU_WRITE(le_t<u32>, ppu_ea(ppu, addr, sizeof(le_t<u32>), true), static_cast<u32>(ppu.gpr[op.rs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -5419,7 +5526,7 @@ auto STFSX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
+	PPU_WRITE(f32, ppu_ea(ppu, addr, sizeof(f32), true), static_cast<float>(ppu.fpr[op.frs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -5434,7 +5541,7 @@ auto STVRX()
 	{
 		const u64 addr = op.ra ? a + b : b;
 		const u32 tail = u32(addr & 15);
-		u8* ptr = vm::_ptr<u8>(addr - 16);
+		u8* ptr = tail ? vm::_ptr<u8>(ppu_ea_current(addr & ~15ull, tail, true)) - (16 - tail) : nullptr;
 		for (u32 i = 15; i > 15 - tail; i--)
 			ptr[i] = s.u8r[i];
 	};
@@ -5450,7 +5557,7 @@ auto STFSUX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
-	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
+	PPU_WRITE(f32, ppu_ea(ppu, addr, sizeof(f32), true), static_cast<float>(ppu.fpr[op.frs]));
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -5471,7 +5578,7 @@ auto STSWI()
 	{
 		if (N > 3)
 		{
-			PPU_WRITE_32(vm::cast(addr), static_cast<u32>(ppu.gpr[reg]));
+			PPU_WRITE_32(ppu_ea(ppu, addr, 4, true), static_cast<u32>(ppu.gpr[reg]));
 			addr += 4;
 			N -= 4;
 		}
@@ -5481,7 +5588,7 @@ auto STSWI()
 			while (N > 0)
 			{
 				N = N - 1;
-				PPU_WRITE_8(vm::cast(addr), (0xFF000000 & buf) >> 24);
+				PPU_WRITE_8(ppu_ea(ppu, addr, 1, true), (0xFF000000 & buf) >> 24);
 				buf <<= 8;
 				addr++;
 			}
@@ -5500,7 +5607,7 @@ auto STFDX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
+	PPU_WRITE(f64, ppu_ea(ppu, addr, sizeof(f64), true), ppu.fpr[op.frs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -5513,7 +5620,7 @@ auto STFDUX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
-	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
+	PPU_WRITE(f64, ppu_ea(ppu, addr, sizeof(f64), true), ppu.fpr[op.frs]);
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -5668,7 +5775,7 @@ auto STHBRX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE(le_t<u16>, vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
+	PPU_WRITE(le_t<u16>, ppu_ea(ppu, addr, sizeof(le_t<u16>), true), static_cast<u16>(ppu.gpr[op.rs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -5715,7 +5822,7 @@ auto STFIWX()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	PPU_WRITE_32(vm::cast(addr), static_cast<u32>(std::bit_cast<u64>(ppu.fpr[op.frs])));
+	PPU_WRITE_32(ppu_ea(ppu, addr, 4, true), static_cast<u32>(std::bit_cast<u64>(ppu.fpr[op.frs])));
 	};
 	RETURN_(ppu, op);
 }
@@ -5753,7 +5860,7 @@ auto DCBZ()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
-	const u32 addr0 = vm::cast(addr) & ~127;
+	const u32 addr0 = ppu_ea(ppu, addr & ~127ull, 128, true);
 
 	if (g_cfg.core.accurate_cache_line_stores)
 	{
@@ -5830,12 +5937,12 @@ auto STW()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
 	const u32 value = static_cast<u32>(ppu.gpr[op.rs]);
-	PPU_WRITE_32(vm::cast(addr), value);
+	PPU_WRITE_32(ppu_ea(ppu, addr, 4, true), value);
 
 	//Insomniac engine v3 & v4 (newer R&C, Fuse, Resitance 3)
 	if (value == 0xAAAAAAAA) [[unlikely]]
 	{
-		vm::reservation_update(vm::cast(addr));
+		vm::reservation_update(ppu_ea(ppu, addr, 4, true));
 	}
 
 	};
@@ -5850,7 +5957,7 @@ auto STWU()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
-	PPU_WRITE_32(vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs]));
+	PPU_WRITE_32(ppu_ea(ppu, addr, 4, true), static_cast<u32>(ppu.gpr[op.rs]));
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -5864,7 +5971,7 @@ auto STB()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
-	PPU_WRITE_8(vm::cast(addr), static_cast<u8>(ppu.gpr[op.rs]));
+	PPU_WRITE_8(ppu_ea(ppu, addr, 1, true), static_cast<u8>(ppu.gpr[op.rs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -5877,7 +5984,7 @@ auto STBU()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
-	PPU_WRITE_8(vm::cast(addr), static_cast<u8>(ppu.gpr[op.rs]));
+	PPU_WRITE_8(ppu_ea(ppu, addr, 1, true), static_cast<u8>(ppu.gpr[op.rs]));
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -5945,7 +6052,7 @@ auto STH()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
-	PPU_WRITE_16(vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
+	PPU_WRITE_16(ppu_ea(ppu, addr, 2, true), static_cast<u16>(ppu.gpr[op.rs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -5958,7 +6065,7 @@ auto STHU()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
-	PPU_WRITE_16(vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
+	PPU_WRITE_16(ppu_ea(ppu, addr, 2, true), static_cast<u16>(ppu.gpr[op.rs]));
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -5990,7 +6097,7 @@ auto STMW()
 	u64 addr = op.ra ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
 	for (u32 i = op.rs; i<32; ++i, addr += 4)
 	{
-		PPU_WRITE_32(vm::cast(addr), static_cast<u32>(ppu.gpr[i]));
+		PPU_WRITE_32(ppu_ea(ppu, addr, 4, true), static_cast<u32>(ppu.gpr[i]));
 	}
 	};
 	RETURN_(ppu, op);
@@ -6058,7 +6165,7 @@ auto STFS()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
-	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
+	PPU_WRITE(f32, ppu_ea(ppu, addr, sizeof(f32), true), static_cast<float>(ppu.fpr[op.frs]));
 	};
 	RETURN_(ppu, op);
 }
@@ -6071,7 +6178,7 @@ auto STFSU()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
-	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
+	PPU_WRITE(f32, ppu_ea(ppu, addr, sizeof(f32), true), static_cast<float>(ppu.fpr[op.frs]));
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -6085,7 +6192,7 @@ auto STFD()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
-	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
+	PPU_WRITE(f64, ppu_ea(ppu, addr, sizeof(f64), true), ppu.fpr[op.frs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -6098,7 +6205,7 @@ auto STFDU()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
-	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
+	PPU_WRITE(f64, ppu_ea(ppu, addr, sizeof(f64), true), ppu.fpr[op.frs]);
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -6152,7 +6259,7 @@ auto STD()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = (op.simm16 & ~3) + (op.ra ? ppu.gpr[op.ra] : 0);
-	PPU_WRITE_64(vm::cast(addr), ppu.gpr[op.rs]);
+	PPU_WRITE_64(ppu_ea(ppu, addr, 8, true), ppu.gpr[op.rs]);
 	};
 	RETURN_(ppu, op);
 }
@@ -6165,7 +6272,7 @@ auto STDU()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + (op.simm16 & ~3);
-	PPU_WRITE_64(vm::cast(addr), ppu.gpr[op.rs]);
+	PPU_WRITE_64(ppu_ea(ppu, addr, 8, true), ppu.gpr[op.rs]);
 	ppu.gpr[op.ra] = addr;
 	};
 	RETURN_(ppu, op);
@@ -6806,15 +6913,18 @@ auto UNK()
 			ppu.cia = vm::get_addr(this_op);
 			ppu.exec_bytes += ppu.cia - old_cia;
 
-			// HLE function index
-			const auto process = idm::get_unlocked<lv2_obj, lv2_process>(id_manager::g_process);
-			const u32 index = (ppu.cia - process->local_typemap->try_get<ppu_function_manager>()->save_addr()) / 8;
-
-			const auto& hle_funcs = ppu_function_manager::get();
-
-			if (ppu.cia % 8 == 4 && index < hle_funcs.size())
+			// HLE function index (a guest operating system has no HLE functions)
+			if (!ppu.supervisor)
 			{
-				return hle_funcs[index](ppu, op, this_op, nullptr);
+				const auto process = idm::get_unlocked<lv2_obj, lv2_process>(id_manager::g_process);
+				const u32 index = (ppu.cia - process->local_typemap->try_get<ppu_function_manager>()->save_addr()) / 8;
+
+				const auto& hle_funcs = ppu_function_manager::get();
+
+				if (ppu.cia % 8 == 4 && index < hle_funcs.size())
+				{
+					return hle_funcs[index](ppu, op, this_op, nullptr);
+				}
 			}
 
 			fmt::throw_exception("Unknown/Illegal opcode: 0x%08x at 0x%x", op.opcode, ppu.cia);
@@ -7835,11 +7945,220 @@ ppu_interpreter_rt::ppu_interpreter_rt() noexcept
 {
 }
 
+// Continue with the next instruction of the chain, as RETURN_ does
+static void ppu_execute_next(ppu_thread& ppu, be_t<u32>* this_op, ppu_intrp_func* next_fn)
+{
+	const auto next_op = this_op + 1;
+	const auto fn = atomic_storage<ppu_intrp_func_t>::observe(next_fn->fn);
+	return fn(ppu, {*next_op}, next_op, next_fn + 1);
+}
+
+// 16-bit absolute addressing: a D-form load or store with RA=0 addresses EXTS(D) (Book I). No GameOS process
+// has anything mapped there, but an lv1 guest operating system keeps its low-memory variables at such
+// addresses (ps2_emu.elf addresses them from 993 instructions, all with a positive displacement).
+template <ppu_itype::type Type>
+static void ppu_absolute_access(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn)
+{
+	const u64 addr = static_cast<u64>(static_cast<s64>(op.simm16));
+
+	if constexpr (Type == ppu_itype::LWZ)
+	{
+		ppu.gpr[op.rd] = ppu_feed_data<u32, use_feed_data>(ppu, addr);
+	}
+	else if constexpr (Type == ppu_itype::LBZ)
+	{
+		ppu.gpr[op.rd] = ppu_feed_data<u8, use_feed_data>(ppu, addr);
+	}
+	else if constexpr (Type == ppu_itype::LHZ)
+	{
+		ppu.gpr[op.rd] = ppu_feed_data<u16, use_feed_data>(ppu, addr);
+	}
+	else if constexpr (Type == ppu_itype::LHA)
+	{
+		ppu.gpr[op.rd] = ppu_feed_data<s16, use_feed_data>(ppu, addr);
+	}
+	else if constexpr (Type == ppu_itype::LFS)
+	{
+		ppu.fpr[op.frd] = ppu_feed_data<f32, use_feed_data>(ppu, addr);
+	}
+	else if constexpr (Type == ppu_itype::LFD)
+	{
+		ppu.fpr[op.frd] = ppu_feed_data<f64, use_feed_data>(ppu, addr);
+	}
+	else if constexpr (Type == ppu_itype::STW)
+	{
+		PPU_WRITE_32(ppu_ea(ppu, addr, 4, true), static_cast<u32>(ppu.gpr[op.rs]));
+	}
+	else if constexpr (Type == ppu_itype::STB)
+	{
+		PPU_WRITE_8(ppu_ea(ppu, addr, 1, true), static_cast<u8>(ppu.gpr[op.rs]));
+	}
+	else if constexpr (Type == ppu_itype::STH)
+	{
+		PPU_WRITE_16(ppu_ea(ppu, addr, 2, true), static_cast<u16>(ppu.gpr[op.rs]));
+	}
+	else if constexpr (Type == ppu_itype::STFS)
+	{
+		PPU_WRITE(f32, ppu_ea(ppu, addr, sizeof(f32), true), static_cast<float>(ppu.fpr[op.frs]));
+	}
+	else
+	{
+		static_assert(Type == ppu_itype::STFD, "Unsupported instruction");
+		PPU_WRITE(f64, ppu_ea(ppu, addr, sizeof(f64), true), ppu.fpr[op.frs]);
+	}
+
+	return ppu_execute_next(ppu, this_op, next_fn);
+}
+
+// The privileged MSR instructions (Book III v2.02 2.3.1 and 3.4.3). Only a thread of an lv1 guest operating
+// system is in supervisor state; in problem state they are Privileged Instruction program exceptions,
+// which no GameOS process is meant to cause.
+static void ppu_check_supervisor(ppu_thread& ppu, ppu_opcode_t op)
+{
+	if (!ppu.supervisor) [[unlikely]]
+	{
+		fmt::throw_exception("Privileged instruction in problem state: 0x%08x at 0x%x", op.opcode, ppu.cia);
+	}
+}
+
+static void ppu_mfmsr(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn)
+{
+	ppu_check_supervisor(ppu, op);
+	ppu.gpr[op.rd] = ppu.supervisor->msr;
+	return ppu_execute_next(ppu, this_op, next_fn);
+}
+
+static void ppu_mtmsrd(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func*)
+{
+	ppu_check_supervisor(ppu, op);
+
+	const u32 old_cia = ppu.cia;
+	const u64 rs = ppu.gpr[op.rs];
+	u64& msr = ppu.supervisor->msr;
+
+	if (op.l15)
+	{
+		// L=1: bits 48 (EE) and 62 (RI) of RS are placed into the MSR, the others are unchanged
+		constexpr u64 mask = ppu_msr::ee | ppu_msr::ri;
+		msr = (msr & ~mask) | (rs & mask);
+	}
+	else
+	{
+		// L=0: SF gets RS0|RS1, EE gets RS48|RS49, IR gets RS58|RS49, DR gets RS59|RS49, bits 1:2, 4:47,
+		// 49:50, 52:57 and 60:63 are copied, and HV (3) and ME (51) are not altered
+		const auto bit = [&](u32 n) { return (rs >> (63 - n)) & 1; };
+		constexpr u64 copied = 0x6000000000000000 | 0x0fffffffffff0000 | 0x6000 | 0x0fc0 | 0xf;
+		u64 value = (rs & copied) | (msr & (ppu_msr::hv | ppu_msr::me));
+		value |= (bit(0) | bit(1)) ? ppu_msr::sf : 0;
+		value |= (bit(48) | bit(49)) ? ppu_msr::ee : 0;
+		value |= (bit(58) | bit(49)) ? ppu_msr::ir : 0;
+		value |= (bit(59) | bit(49)) ? ppu_msr::dr : 0;
+		msr = value;
+	}
+
+	// An External or Decrementer interrupt this enables is taken before the next instruction executes,
+	// which the interpreter loop checks before resuming at cia
+	ppu.cia = vm::get_addr(this_op) + 4;
+	ppu.exec_bytes += ppu.cia - old_cia;
+}
+
+static void ppu_rfid(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func*)
+{
+	ppu_check_supervisor(ppu, op);
+
+	const u32 old_cia = ppu.cia;
+	auto& sv = *ppu.supervisor;
+	const u64 srr1 = sv.srr1;
+	const auto bit = [&](u32 n) { return (srr1 >> (63 - n)) & 1; };
+
+	// Bits 1:2, 4:32, 37:41, 49:50, 52:57 and 60:63 of SRR1 are copied; SF gets SRR1_0|SRR1_1, EE gets
+	// SRR1_48|SRR1_49, IR gets SRR1_58|SRR1_49 and DR gets SRR1_59|SRR1_49. HV can only be cleared and ME
+	// only changes in hypervisor state, so with HV=0 both keep their value.
+	constexpr u64 copied = 0x6000000000000000 | 0x0fffffff80000000 | 0x0000000007c00000 | 0x6000 | 0x0fc0 | 0xf;
+	u64 value = (srr1 & copied) | (sv.msr & ppu_msr::me);
+	value |= (sv.msr & ppu_msr::hv) & (srr1 & ppu_msr::hv);
+	value |= (bit(0) | bit(1)) ? ppu_msr::sf : 0;
+	value |= (bit(48) | bit(49)) ? ppu_msr::ee : 0;
+	value |= (bit(58) | bit(49)) ? ppu_msr::ir : 0;
+	value |= (bit(59) | bit(49)) ? ppu_msr::dr : 0;
+	sv.msr = value;
+
+	// The next instruction comes from SRR0 with the low two bits cleared (the high 32 bits are dropped in
+	// 32-bit mode). An interrupt the new MSR enables is taken there first, by the interpreter loop.
+	const u64 target = sv.srr0 & ~3ull;
+	ppu.exec_bytes += vm::get_addr(this_op) + 4 - old_cia;
+	ppu.cia = static_cast<u32>(value & ppu_msr::sf ? target : (target & 0xffffffff));
+}
+
+// The SLB and TLB management instructions (Book III v2.02 4.9.3, 4.9.4). The model's TLB is the
+// translations a thread cached, which any of them drops.
+static ppu_supervisor_state::slb_entry& ppu_slb_entry(ppu_thread& ppu, u64 index)
+{
+	// The PPE has 64 SLB entries (Cell BE Handbook v1.1 4.2.4); a larger index is undefined
+	if (index >= ppu.supervisor->slb.size())
+	{
+		fmt::throw_exception("SLB index %u at 0x%x", index, ppu.cia);
+	}
+
+	return ppu.supervisor->slb[index];
+}
+
+static void ppu_slbmte(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn)
+{
+	ppu_check_supervisor(ppu, op);
+
+	// RB holds the ESID data (ESID 0:35, V 36) and the entry index (52:63), RS the VSID data
+	const u64 rb = ppu.gpr[op.rb];
+	auto& entry = ppu_slb_entry(ppu, rb & 0xfff);
+	entry.esid_data = rb & ~0xfffull;
+	entry.vsid_data = ppu.gpr[op.rs];
+	ppu.supervisor->translations.clear();
+	return ppu_execute_next(ppu, this_op, next_fn);
+}
+
+static void ppu_slbie(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn)
+{
+	ppu_check_supervisor(ppu, op);
+
+	// The entry translating the ESID in RB 0:35, if any, is made invalid
+	for (auto& entry : ppu.supervisor->slb)
+	{
+		if ((entry.esid_data & 0x8000000) && (entry.esid_data >> 28) == ppu.gpr[op.rb] >> 28)
+		{
+			entry.esid_data &= ~0x8000000ull;
+		}
+	}
+
+	ppu.supervisor->translations.clear();
+	return ppu_execute_next(ppu, this_op, next_fn);
+}
+
+static void ppu_slbmfee(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn)
+{
+	ppu_check_supervisor(ppu, op);
+	ppu.gpr[op.rd] = ppu_slb_entry(ppu, ppu.gpr[op.rb] & 0xfff).esid_data;
+	return ppu_execute_next(ppu, this_op, next_fn);
+}
+
+static void ppu_slbmfev(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn)
+{
+	ppu_check_supervisor(ppu, op);
+	ppu.gpr[op.rd] = ppu_slb_entry(ppu, ppu.gpr[op.rb] & 0xfff).vsid_data;
+	return ppu_execute_next(ppu, this_op, next_fn);
+}
+
+static void ppu_tlbie(ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn)
+{
+	ppu_check_supervisor(ppu, op);
+	ppu.supervisor->translations.clear();
+	return ppu_execute_next(ppu, this_op, next_fn);
+}
+
 ppu_intrp_func_t ppu_interpreter_rt::decode(u32 opv) const noexcept
 {
 	const auto op = ppu_opcode_t{opv};
 
-	switch (g_ppu_itype.decode(opv))
+	switch (const auto type = g_ppu_itype.decode(opv))
 	{
 	case ppu_itype::LWZ:
 	case ppu_itype::LBZ:
@@ -7853,13 +8172,43 @@ ppu_intrp_func_t ppu_interpreter_rt::decode(u32 opv) const noexcept
 	case ppu_itype::STFS:
 	case ppu_itype::STFD:
 	{
-		// Minor optimization: 16-bit absolute addressing never points to a valid memory
+		// Minor optimization: the regular handlers always add a base register, so 16-bit absolute
+		// addressing (RA=0), which only an lv1 guest operating system uses, has handlers of its own
 		if (!op.ra)
 		{
-			return [](ppu_thread&, ppu_opcode_t op, be_t<u32>*, ppu_intrp_func*)
+			switch (type)
 			{
-				fmt::throw_exception("Invalid instruction: %s r%d,0x%016x(r0)", g_ppu_iname.decode(op.opcode), op.rd, op.simm16);
-			};
+			case ppu_itype::LWZ: return ppu_absolute_access<ppu_itype::LWZ>;
+			case ppu_itype::LBZ: return ppu_absolute_access<ppu_itype::LBZ>;
+			case ppu_itype::STW: return ppu_absolute_access<ppu_itype::STW>;
+			case ppu_itype::STB: return ppu_absolute_access<ppu_itype::STB>;
+			case ppu_itype::LHZ: return ppu_absolute_access<ppu_itype::LHZ>;
+			case ppu_itype::LHA: return ppu_absolute_access<ppu_itype::LHA>;
+			case ppu_itype::STH: return ppu_absolute_access<ppu_itype::STH>;
+			case ppu_itype::LFS: return ppu_absolute_access<ppu_itype::LFS>;
+			case ppu_itype::LFD: return ppu_absolute_access<ppu_itype::LFD>;
+			case ppu_itype::STFS: return ppu_absolute_access<ppu_itype::STFS>;
+			default: return ppu_absolute_access<ppu_itype::STFD>;
+			}
+		}
+
+		break;
+	}
+	case ppu_itype::UNK:
+	{
+		// Privileged instructions the decoder tables do not know (primary opcode and extended opcode)
+		switch (opv & 0xfc0007fe)
+		{
+		case 0x7c0000a6: return ppu_mfmsr; // mfmsr (31/83)
+		case 0x7c000164: return ppu_mtmsrd; // mtmsrd (31/178)
+		case 0x4c000024: return ppu_rfid; // rfid (19/18)
+		case 0x7c000324: return ppu_slbmte; // slbmte (31/402)
+		case 0x7c000364: return ppu_slbie; // slbie (31/434)
+		case 0x7c000726: return ppu_slbmfee; // slbmfee (31/915)
+		case 0x7c0006a6: return ppu_slbmfev; // slbmfev (31/851)
+		case 0x7c000224: return ppu_tlbie; // tlbiel (31/274)
+		case 0x7c000264: return ppu_tlbie; // tlbie (31/306)
+		default: break;
 		}
 
 		break;

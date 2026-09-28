@@ -9,6 +9,8 @@
 #include "util/logs.hpp"
 #include "util/v128.hpp"
 
+#include <unordered_map>
+
 LOG_CHANNEL(ppu_log, "PPU");
 
 enum class ppu_cmd : u32
@@ -133,6 +135,128 @@ enum class ppu_debugger_mode : u32
 
 	max_mode,
 };
+
+// Machine State Register bits (PowerPC Operating Environment Architecture Book III v2.02 2.2.3, and VEC
+// from the Vector/SIMD Multimedia Extension PEM 2.4.1), as masks of the 64-bit register
+namespace ppu_msr
+{
+	constexpr u64 sf = 1ull << 63; // 64-bit mode
+	constexpr u64 hv = 1ull << 60; // Hypervisor state
+	constexpr u64 vec = 1ull << 25; // Vector unit available
+	constexpr u64 ee = 1ull << 15; // External and Decrementer interrupts enabled
+	constexpr u64 pr = 1ull << 14; // Problem state
+	constexpr u64 fp = 1ull << 13; // Floating-point available
+	constexpr u64 me = 1ull << 12; // Machine check enable
+	constexpr u64 fe0 = 1ull << 11; // Floating-point exception mode 0
+	constexpr u64 se = 1ull << 10; // Single-step trace
+	constexpr u64 be = 1ull << 9; // Branch trace
+	constexpr u64 fe1 = 1ull << 8; // Floating-point exception mode 1
+	constexpr u64 ir = 1ull << 5; // Instruction relocation
+	constexpr u64 dr = 1ull << 4; // Data relocation
+	constexpr u64 pmm = 1ull << 2; // Performance monitor mark
+	constexpr u64 ri = 1ull << 1; // Recoverable interrupt
+	constexpr u64 le = 1ull << 0; // Little-endian mode
+
+	// Bits 33:36 and 42:47 of SRR1, which an interrupt fills with its own cause information instead of
+	// copying the MSR (Book III v2.02 5.4); zero for External, Decrementer and System Call interrupts
+	constexpr u64 srr1_cause_bits = (0xfull << (63 - 36)) | (0x3full << (63 - 47));
+}
+
+// Supervisor state of a PPE hardware thread (PowerPC Operating Environment Architecture Book III v2.02,
+// Cell Broadband Engine Registers v1.5). Only a thread running an lv1 guest operating system has it:
+// such a guest (ps2_emu.self) executes in supervisor state and takes its own interrupts, while threads
+// of GameOS processes run in problem state and never see any of this.
+struct ppu_supervisor_state
+{
+	u64 msr = 0; // Machine State Register
+	u64 srr0 = 0; // Machine Status Save/Restore Register 0
+	u64 srr1 = 0; // Machine Status Save/Restore Register 1
+	u64 sprg[3]{}; // SPRG0-SPRG2, the software-use SPRs the guest image touches
+	u64 dsisr = 0; // Data Storage Interrupt Status Register
+	u64 dar = 0; // Data Address Register
+
+	// PPE hardware thread number, reported through CTRL[CT]
+	u32 hw_thread = 0;
+
+	// The Decrementer counts down at the timebase frequency (Book III 6.3), so it is kept as the value
+	// written by the last mtspr DEC and the timebase at that moment. The value lv1 leaves in DEC when
+	// it starts a guest has not been determined: 0x7fffffff is what the guest itself writes to mean
+	// "no deadline" (ps2_emu.elf 0x39d0), so the model starts from there.
+	u32 dec_value = 0x7fffffff;
+	u64 dec_timebase = 0;
+
+	// External interrupt condition raised by lv1 (virtual interrupt plugs), taken at 0x500 while MSR[EE]=1
+	atomic_t<u32> external_pending{0};
+
+	// The Segment Lookaside Buffer (Book III v2.02 4.4.3, 64 entries on the PPE): each entry as slbmte wrote
+	// it, the ESID data without the index and the VSID data
+	struct slb_entry
+	{
+		u64 esid_data = 0;
+		u64 vsid_data = 0;
+	};
+
+	std::array<slb_entry, 64> slb{};
+
+	// Translations already made, effective page (4 KB) to emulator address, kept until the SLB or the
+	// hash table changes (the TLB and ERATs of the model)
+	std::unordered_map<u64, u32> translations;
+	u64 translations_generation = 0;
+
+	// Device registers are not memory: a load from a device window reads the registers into a scratch page
+	// before the instruction, and a store is handed to the device from that page once the instruction is done
+	u32 mmio_scratch = 0;
+
+	struct mmio_store
+	{
+		u64 lpar_addr;
+		u32 addr;
+		u32 size;
+	};
+
+	std::vector<mmio_store> mmio_stores;
+
+	u32 read_dec(u64 timebase) const
+	{
+		return dec_value - static_cast<u32>(timebase - dec_timebase);
+	}
+
+	void write_dec(u32 value, u64 timebase)
+	{
+		dec_value = value;
+		dec_timebase = timebase;
+	}
+
+	// A Decrementer exception exists while bit 0 of DEC is set (Book III 6.3)
+	bool dec_exception(u64 timebase) const
+	{
+		return static_cast<s32>(read_dec(timebase)) < 0;
+	}
+};
+
+class ppu_thread;
+
+// A storage interrupt the address translation of a supervisor thread raises (Book III v2.02 5.5.3 to 5.5.6):
+// the vector, and DAR and DSISR for the data ones, SRR1's cause bits for the instruction ones
+struct ppu_storage_interrupt
+{
+	u32 vector;
+	u64 dar = 0;
+	u64 dsisr = 0;
+	u64 srr1_cause = 0;
+};
+
+// The emulator address of an effective address a supervisor thread accesses for data, or of the
+// instruction it fetches. Throws ppu_storage_interrupt when the translation fails.
+u32 ppu_supervisor_translate(ppu_thread& ppu, u64 ea, u32 size, bool store, bool fetch = false);
+
+// Take an External (0x500), Decrementer (0x900) or System Call (0xc00) interrupt on a supervisor thread,
+// resuming at return_addr afterwards
+void ppu_supervisor_interrupt(ppu_thread& ppu, u32 vector, u64 return_addr);
+
+// Take the pending External or Decrementer interrupt if MSR[EE] allows it. next_addr is the address of
+// the instruction that would execute next. Returns true if an interrupt was taken.
+bool ppu_supervisor_check_interrupts(ppu_thread& ppu, u64 next_addr);
 
 class ppu_thread : public cpu_thread
 {
@@ -335,6 +459,9 @@ public:
 
 	// Hypervisor context data
 	rpcs3::hypervisor_context_t hv_ctx; // HV context for gate enter exit. Keep at a low struct offset.
+
+	// Supervisor state, allocated only for threads of an lv1 guest operating system
+	std::unique_ptr<ppu_supervisor_state> supervisor;
 
 	u32 sdk_version = umax; // Local copy of lv2_process::sdk_ver
 	bool has_root_perm = false; // Local copy of lv2_process::has_root_perm

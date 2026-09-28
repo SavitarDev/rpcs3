@@ -22,6 +22,7 @@
 #include "PPUDisAsm.h"
 #include "SPURecompiler.h"
 #include "timers.hpp"
+#include "lv1/lv1.h"
 #include "lv2/sys_sync.h"
 #include "lv2/sys_prx.h"
 #include "lv2/sys_overlay.h"
@@ -1717,14 +1718,16 @@ std::vector<std::pair<u32, u32>> ppu_thread::dump_callstack_list() const
 	{
 		auto is_invalid = [&](u64 addr)
 		{
-			if (addr > u32{umax} || addr % 4 || !vm::check_addr(static_cast<u32>(addr), vm::page_executable))
+			// Addresses up to 4 end the chain even where they are executable, as in a guest operating
+			// system whose interrupt vectors live at address 0: the first frame saves a zero return address
+			if (addr > u32{umax} || addr % 4 || addr <= 4 || !vm::check_addr(static_cast<u32>(addr), vm::page_executable))
 			{
 				return true;
 			}
 
-			// Ignore HLE stop address
+			// Ignore HLE stop address (a guest operating system thread has none)
 
-			return addr == exports_table->func_addr(1, true);
+			return exports_table && addr == exports_table->func_addr(1, true);
 		};
 
 		if (is_first && !is_invalid(_lr))
@@ -2752,6 +2755,197 @@ void ppu_thread::cpu_wait(bs_t<cpu_flag> old)
 	state.wait(old);
 }
 
+void ppu_supervisor_interrupt(ppu_thread& ppu, u32 vector, u64 return_addr)
+{
+	auto& sv = *ppu.supervisor;
+
+	// Book III v2.02 5.4: bits 33:36 and 42:47 of SRR1 carry interrupt-specific information, which is
+	// zero for External, Decrementer and System Call interrupts; the other bits are a copy of the MSR.
+	sv.srr0 = return_addr;
+	sv.srr1 = sv.msr & ~ppu_msr::srr1_cause_bits;
+
+	if (vector == 0x500)
+	{
+		// A guest's External interrupts are lv1's virtual ones, which lv1 delivers itself on its way back to
+		// the partition (lv1 4.93 0x1870 after an interrupt of its own, 0x18e0 at the end of a hypervisor
+		// call): SRR0 and SRR1 as the hardware would set them, and an MSR that keeps bits 0:47 of SRR1 with
+		// SF set, entering at the vector lv1 gives every partition thread (0x500, 0x2c3dc8). Unlike the
+		// architected interrupt this keeps VEC and clears ME.
+		sv.msr = (sv.srr1 & ~0xffffull) | ppu_msr::sf;
+	}
+	else
+	{
+		// Figure 35: IR, DR, FE0, FE1, EE, RI, BE, FP, PMM, PR and SE are cleared and SF is set; ME and HV
+		// are not altered for these interrupts (HV is 0 for a guest), and LE is taken from ILE, which is 0
+		// on this big-endian machine. VEC is cleared as the Vector/SIMD PEM (Table 5-1) specifies.
+		sv.msr = ppu_msr::sf | (sv.msr & (ppu_msr::hv | ppu_msr::me));
+	}
+
+	ppu.cia = vector;
+}
+
+u32 ppu_supervisor_translate(ppu_thread& ppu, u64 ea, u32 size, bool store, bool fetch)
+{
+	auto& sv = *ppu.supervisor;
+
+	// In 32-bit mode the high 32 bits of an effective address are ignored (Book I 1.10.3)
+	if (!(sv.msr & ppu_msr::sf))
+	{
+		ea &= 0xffffffff;
+	}
+
+	if (!(sv.msr & (fetch ? ppu_msr::ir : ppu_msr::dr)))
+	{
+		// Real mode: the address is a logical partition address, and the partition's real mode area is its
+		// memory from address 0 (where lv1 enters the image). The real mode limit lv1 sets has not been
+		// determined; an access past that memory stops.
+		if (ea + size > lv1_guest_region0_size)
+		{
+			fmt::throw_exception("Real mode access to 0x%llx (0x%x bytes) outside the partition's memory from address 0", ea, size);
+		}
+
+		return static_cast<u32>(ea);
+	}
+
+	if (sv.translations_generation != lv1_htab_generation())
+	{
+		sv.translations.clear();
+		sv.translations_generation = lv1_htab_generation();
+	}
+
+	// A cached translation holds the emulator address of the page, with bit 0 set if stores may use it
+	u32 page;
+
+	if (const auto found = sv.translations.find(ea >> 12); found != sv.translations.end() && (!store || found->second & 1))
+	{
+		page = found->second & ~0xfffu;
+	}
+	else
+	{
+		// Book III v2.02 4.4.3: the SLB entry whose ESID matches; none is a Data or Instruction Segment interrupt
+		const u64 esid = ea >> 28;
+		const ppu_supervisor_state::slb_entry* entry = nullptr;
+
+		for (const auto& e : sv.slb)
+		{
+			if ((e.esid_data & 0x8000000) && (e.esid_data >> 28) == esid)
+			{
+				entry = &e;
+				break;
+			}
+		}
+
+		if (!entry)
+		{
+			throw ppu_storage_interrupt{fetch ? 0x480u : 0x380u, fetch ? 0 : ea};
+		}
+
+		// VSID data: VSID in bits 0:51, Ks 52, Kp 53, N 54, L 55, C 56, LP 58:59 (Cell BE Handbook v1.1 4.2.4)
+		const u64 vsid_data = entry->vsid_data;
+		const auto translation = lv1_htab_lookup(vsid_data >> 12, ea & 0xfffffff, (vsid_data >> 8) & 1, (vsid_data >> 4) & 3);
+
+		if (!translation)
+		{
+			// 4.5.2: no matching entry is a Data Storage interrupt with DSISR bit 1 (and bit 6 for a store), or
+			// an Instruction Storage interrupt with SRR1 bit 33
+			throw ppu_storage_interrupt{fetch ? 0x400u : 0x300u, fetch ? 0 : ea, fetch ? 0 : (0x40000000ull | (store ? 0x2000000ull : 0)), fetch ? 0x40000000ull : 0};
+		}
+
+		// 4.6: storage protection by the PP bits of the entry and the segment's key (Ks in privileged state);
+		// with key 1, PP 00 allows nothing, 01 and 11 reading, 10 both, and with key 0 only PP 11 is read-only.
+		// An instruction fetch from a page with N or G set is also a protection violation.
+		const u64 pp = translation->hpte_r & 3;
+		const bool key = (vsid_data >> ((sv.msr & ppu_msr::pr) ? 10 : 11)) & 1;
+		const bool readable = !(key && pp == 0);
+		const bool writable = key ? pp == 2 : pp != 3;
+
+		if (!readable || (store && !writable) || (fetch && ((vsid_data >> 9) & 1 || translation->hpte_r & 0x8 || translation->hpte_r & 0x4)))
+		{
+			throw ppu_storage_interrupt{fetch ? 0x400u : 0x300u, fetch ? 0 : ea, fetch ? 0 : (0x8000000ull | (store ? 0x2000000ull : 0)), fetch ? 0x8000000ull : 0};
+		}
+
+		const u64 lpar = translation->lpar_addr & ~0xfffull;
+		const auto memory = lpar + 0x1000 > lv1_guest_region0_size ? lv1_memory_address(lpar) : std::nullopt;
+
+		if (memory)
+		{
+			// Memory outside the partition's memory from address 0 (a logical SPE's local store)
+			page = *memory;
+			sv.translations[ea >> 12] = page | (writable ? 1 : 0);
+		}
+		else if (lpar + 0x1000 > lv1_guest_region0_size)
+		{
+			// A device window: the access goes through the scratch page, at the same offset in the page
+			if ((ea & 0xfff) + size > 0x1000 || fetch)
+			{
+				fmt::throw_exception("Access to device registers at effective address 0x%llx (0x%x bytes%s) is not implemented", ea, size, fetch ? ", fetch" : "");
+			}
+
+			const u32 addr = sv.mmio_scratch | static_cast<u32>(ea & 0xfff);
+
+			if (store)
+			{
+				sv.mmio_stores.push_back({translation->lpar_addr, addr, size});
+			}
+			else
+			{
+				lv1_device_access(translation->lpar_addr, vm::_ptr<u8>(addr), size, false);
+			}
+
+			return addr;
+		}
+		else
+		{
+			page = static_cast<u32>(lpar);
+			sv.translations[ea >> 12] = page | (writable ? 1 : 0);
+		}
+	}
+
+	const u32 addr = page | static_cast<u32>(ea & 0xfff);
+
+	// An access across a page boundary is translated on both pages; the model needs them to follow each other
+	if ((ea & 0xfff) + size > 0x1000)
+	{
+		if (ppu_supervisor_translate(ppu, (ea | 0xfff) + 1, 1, store, fetch) != page + 0x1000)
+		{
+			fmt::throw_exception("An access across pages that do not follow each other (0x%llx, 0x%x bytes) is not implemented", ea, size);
+		}
+	}
+
+	// The interpreter executes code at the address it was fetched from, which has to be the effective one
+	if (fetch && addr != ea)
+	{
+		fmt::throw_exception("Instruction fetch from effective address 0x%llx, translated to 0x%x, is not implemented", ea, addr);
+	}
+
+	return addr;
+}
+
+bool ppu_supervisor_check_interrupts(ppu_thread& ppu, u64 next_addr)
+{
+	auto& sv = *ppu.supervisor;
+
+	if (!(sv.msr & ppu_msr::ee))
+	{
+		return false;
+	}
+
+	// External and Decrementer exceptions have equal priority (Book III 5.8); either may be taken first
+	if (sv.external_pending)
+	{
+		ppu_supervisor_interrupt(ppu, 0x500, next_addr);
+		return true;
+	}
+
+	if (sv.dec_exception(lv1_timebase()))
+	{
+		ppu_supervisor_interrupt(ppu, 0x900, next_addr);
+		return true;
+	}
+
+	return false;
+}
+
 void ppu_thread::exec_task()
 {
 #ifdef __APPLE__
@@ -2792,6 +2986,51 @@ void ppu_thread::exec_task()
 		if (test_stopped()) [[unlikely]]
 		{
 			return;
+		}
+
+		// A guest operating system takes its External and Decrementer interrupts between instructions, with
+		// cia being the next one to execute. It runs one instruction at a time, so that an instruction whose
+		// address translation fails can be restarted: the storage interrupt saves its address in SRR0.
+		if (supervisor) [[unlikely]]
+		{
+			ppu_supervisor_check_interrupts(*this, cia);
+
+			try
+			{
+				ppu_supervisor_translate(*this, cia, 4, false, true);
+
+				const auto op = reinterpret_cast<be_t<u32>*>(mem_ + u64{cia});
+				const auto fn = reinterpret_cast<ppu_intrp_func*>(cache + u64{cia} * 2);
+				fn->fn(*this, {*op}, op, &ppu_ret);
+
+				// The stores the instruction made to device registers reach the devices now
+				for (const auto& st : supervisor->mmio_stores)
+				{
+					lv1_device_access(st.lpar_addr, vm::_ptr<u8>(st.addr), st.size, true);
+				}
+
+				supervisor->mmio_stores.clear();
+			}
+			catch (const ppu_storage_interrupt& interrupt)
+			{
+				auto& sv = *supervisor;
+				sv.mmio_stores.clear();
+
+				if (interrupt.vector == 0x300 || interrupt.vector == 0x380)
+				{
+					sv.dar = interrupt.dar;
+				}
+
+				if (interrupt.vector == 0x300)
+				{
+					sv.dsisr = interrupt.dsisr;
+				}
+
+				ppu_supervisor_interrupt(*this, interrupt.vector, cia);
+				sv.srr1 |= interrupt.srr1_cause;
+			}
+
+			continue;
 		}
 
 		gv_zeroupper();
@@ -3247,14 +3486,16 @@ void ppu_thread::fast_call(u32 addr, u64 rtoc, bool is_thread_entry)
 		has_ppc_seg = process->ppc_seg;
 		sdk_version = process->sdk_ver;
 		vm_owner = process->memory_4GB_model;
-		exports_table = ensure(process->local_typemap->try_get<ppu_function_manager>());
+
+		// A guest operating system has no HLE functions, and its entry is never returned from
+		exports_table = supervisor ? nullptr : ensure(process->local_typemap->try_get<ppu_function_manager>());
 		proc_id = id_manager::g_process;
 	}
 
 	interrupt_thread_executing = true;
 	cia = addr;
 	gpr[2] = rtoc;
-	lr = exports_table->func_addr(1, true); // HLE stop address
+	lr = exports_table ? exports_table->func_addr(1, true) : 0; // HLE stop address
 	current_function = nullptr;
 
 	if (std::exchange(loaded_from_savestate, false))
@@ -3312,7 +3553,7 @@ void ppu_thread::fast_call(u32 addr, u64 rtoc, bool is_thread_entry)
 			gpr[2] = old_rtoc;
 			lr = old_lr;
 		}
-		else if (state & cpu_flag::ret && cia == exports_table->func_addr(1, true) + 4 && is_thread_entry)
+		else if (state & cpu_flag::ret && exports_table && cia == exports_table->func_addr(1, true) + 4 && is_thread_entry)
 		{
 			std::string ret;
 			dump_all(ret);
