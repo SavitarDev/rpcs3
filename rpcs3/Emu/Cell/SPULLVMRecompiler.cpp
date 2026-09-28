@@ -4,6 +4,7 @@
 #include "Emu/System.h"
 #include "Emu/system_config.h"
 #include "Emu/IdManager.h"
+#include "Emu/Cell/lv1/lv1.h"
 #include "Emu/Cell/timers.hpp"
 #include "Emu/Cell/lv2/sys_time.h"
 #include "Emu/Memory/vm_reservation.h"
@@ -5096,6 +5097,13 @@ public:
 		}
 		case MFC_EAH:
 		{
+			if (lv1_guest_running())
+			{
+				// The SPEs of a partition lv1 runs address its 64-bit effective addresses
+				m_ir->CreateStore(val.value, spu_ptr(&spu_thread::ch_mfc_cmd, &spu_mfc_cmd::eah));
+				return;
+			}
+
 			if (auto ci = llvm::dyn_cast<llvm::ConstantInt>(val.value))
 			{
 				if (ci->getZExtValue() == 0)
@@ -5133,8 +5141,9 @@ public:
 
 			if (auto ci = llvm::dyn_cast<llvm::ConstantInt>(trunc<u8>(val).eval(m_ir)))
 			{
-				if (g_cfg.core.mfc_debug)
+				if (g_cfg.core.mfc_debug || lv1_guest_running())
 				{
+					// The SPEs of a partition lv1 runs translate their effective addresses (spu_thread::lv1_translate)
 					break;
 				}
 

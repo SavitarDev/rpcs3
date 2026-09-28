@@ -726,6 +726,12 @@ void spu_int_ctrl_t::set(u64 ints)
 	// notify if at least 1 bit was set
 	if (ints && ~stat.fetch_or(ints) & ints)
 	{
+		if (lv1_raise)
+		{
+			lv1_raise();
+			return;
+		}
+
 		std::shared_lock rlock(id_manager::g_mutex);
 
 		if (lv2_obj::check(tag))
@@ -2037,11 +2043,18 @@ void spu_thread::push_snr(u32 number, u32 value)
 	});
 }
 
-void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
+void spu_thread::do_dma_transfer(spu_thread* _this, spu_mfc_cmd args, u8* ls)
 {
 	perf_meter<"DMA"_u32> perf_;
 
 	const bool is_get = (args.cmd & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_START_MASK)) == MFC_GET_CMD;
+
+	if (_this && _this->lv1_translate)
+	{
+		// The effective address is the partition's, 64 bits wide
+		args.eal = _this->lv1_translate(u64{args.eah} << 32 | args.eal, args.size, !is_get);
+		args.eah = 0;
+	}
 
 	u32 eal = args.eal;
 	u32 lsa = args.lsa & 0x3ffff;
@@ -2829,7 +2842,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	static_assert(sizeof(v128) % sizeof(list_element) == 0);
 
 	spu_mfc_cmd transfer;
-	transfer.eah  = 0;
+	transfer.eah  = args.eah;
 	transfer.tag  = args.tag;
 	transfer.cmd  = MFC{static_cast<u8>(args.cmd & ~0xf)};
 
@@ -2841,7 +2854,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 
 	u8 optimization_compatible = transfer.cmd & (MFC_GET_CMD | MFC_PUT_CMD);
 
-	if (spu_log.trace || g_cfg.core.spu_accurate_dma || g_cfg.core.mfc_debug)
+	if (spu_log.trace || g_cfg.core.spu_accurate_dma || g_cfg.core.mfc_debug || lv1_translate)
 	{
 		optimization_compatible = 0;
 	}
@@ -4230,6 +4243,13 @@ bool spu_thread::process_mfc_cmd()
 
 	spu::scheduler::concurrent_execution_watchdog watchdog(*this);
 	spu_log.trace("DMAC: (%s)", ch_mfc_cmd);
+
+	if (lv1_translate && (ch_mfc_cmd.cmd == MFC_GETLLAR_CMD || ch_mfc_cmd.cmd == MFC_PUTLLC_CMD || ch_mfc_cmd.cmd == MFC_PUTLLUC_CMD || ch_mfc_cmd.cmd == MFC_PUTQLLUC_CMD))
+	{
+		// The atomic commands reach memory without do_dma_transfer; their effective address is the partition's
+		ch_mfc_cmd.eal = lv1_translate(u64{ch_mfc_cmd.eah} << 32 | ch_mfc_cmd.eal, 128, ch_mfc_cmd.cmd != MFC_GETLLAR_CMD);
+		ch_mfc_cmd.eah = 0;
+	}
 
 	switch (ch_mfc_cmd.cmd)
 	{

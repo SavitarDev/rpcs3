@@ -7,6 +7,7 @@
 #include "Emu/system_utils.hpp"
 #include "Emu/cache_utils.hpp"
 #include "Emu/IdManager.h"
+#include "Emu/Cell/lv1/lv1.h"
 #include "Emu/localized_string.h"
 #include "Crypto/sha1.h"
 #include "Utilities/StrUtil.h"
@@ -8780,6 +8781,13 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point, s
 			};
 
 			allow_pattern = std::any_of(allowed_patterns.begin(), allowed_patterns.end(), FN(pattern_hash == x));
+		}
+
+		if (lv1_guest_running())
+		{
+			// The SPEs of a partition lv1 runs translate their effective addresses (spu_thread::lv1_translate),
+			// which the pattern's inline access does not
+			allow_pattern = false;
 		}
 
 		if (allow_pattern)

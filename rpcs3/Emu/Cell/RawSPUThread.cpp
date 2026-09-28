@@ -159,7 +159,18 @@ bool spu_thread::read_reg(const u32 addr, u32& value)
 			if (cmd.size)
 			{
 				// Perform transfer immediately
-				do_dma_transfer(nullptr, cmd, ls);
+				if (lv1_translate)
+				{
+					// The effective address is the partition's, 64 bits wide
+					spu_mfc_cmd transfer = cmd;
+					transfer.eal = lv1_translate(u64{cmd.eah} << 32 | cmd.eal, cmd.size, !(cmd.cmd & MFC_GET_CMD));
+					transfer.eah = 0;
+					do_dma_transfer(nullptr, transfer, ls);
+				}
+				else
+				{
+					do_dma_transfer(nullptr, cmd, ls);
+				}
 			}
 
 			if (cmd.cmd & MFC_START_MASK)

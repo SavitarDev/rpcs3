@@ -464,6 +464,9 @@ struct spu_int_ctrl_t
 
 	shared_ptr<struct lv2_int_tag> tag;
 
+	// For an SPE lv1 hands to a partition (Emu/Cell/lv1): called when an enabled interrupt becomes pending
+	std::function<void()> lv1_raise;
+
 	void set(u64 ints);
 
 	void clear(u64 ints)
@@ -732,6 +735,10 @@ public:
 
 	u64 snr_config = 0; // SPU SNR Config Register
 
+	// For an SPE lv1 hands to a partition (Emu/Cell/lv1): the emulator address of an effective address the MFC
+	// accesses, translated through the SPE's segment lookaside buffer and the partition's page table
+	std::function<u32(u64 ea, u32 size, bool store)> lv1_translate;
+
 	spu_channel ch_snr1{}; // SPU Signal Notification Register 1
 	spu_channel ch_snr2{}; // SPU Signal Notification Register 2
 
@@ -858,7 +865,7 @@ public:
 	std::array<std::array<u8, 16>, SPU_LS_SIZE / 128> eventstat_wait_time{};
  
 	void push_snr(u32 number, u32 value);
-	static void do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls);
+	static void do_dma_transfer(spu_thread* _this, spu_mfc_cmd args, u8* ls);
 	bool do_dma_check(const spu_mfc_cmd& args);
 	bool do_list_transfer(spu_mfc_cmd& args);
 	void do_putlluc(const spu_mfc_cmd& args);
