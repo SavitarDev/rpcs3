@@ -196,6 +196,10 @@ target_sources(rpcs3_emu PRIVATE
     Cell/SPUCommonRecompiler.cpp
     Cell/SPULLVMRecompiler.cpp
     Cell/SPUThread.cpp
+    Cell/lv1/lv1.cpp
+    Cell/lv1/lv1_guest_os.cpp
+    Cell/lv1/lv1_bdvd.cpp
+    Cell/lv1/lv1_usb.cpp
     Cell/lv2/lv2.cpp
     Cell/lv2/sys_bdemu.cpp
     Cell/lv2/sys_btsetting.cpp

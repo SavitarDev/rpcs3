@@ -322,6 +322,10 @@
     <ClCompile Include="Emu\Cell\lv2\sys_hid.cpp" />
     <ClCompile Include="Emu\Cell\lv2\sys_io.cpp" />
     <ClCompile Include="Emu\Cell\lv2\sys_rsxaudio.cpp" />
+    <ClCompile Include="Emu\Cell\lv1\lv1.cpp" />
+    <ClCompile Include="Emu\Cell\lv1\lv1_guest_os.cpp" />
+    <ClCompile Include="Emu\Cell\lv1\lv1_usb.cpp" />
+    <ClCompile Include="Emu\Cell\lv1\lv1_bdvd.cpp" />
     <ClCompile Include="Emu\Cell\lv2\sys_sm.cpp" />
     <ClCompile Include="Emu\Cell\lv2\sys_storage.cpp" />
     <ClCompile Include="Emu\Cell\lv2\sys_uart.cpp" />
@@ -906,6 +910,9 @@
     <ClInclude Include="Emu\Cell\lv2\sys_hid.h" />
     <ClInclude Include="Emu\Cell\lv2\sys_io.h" />
     <ClInclude Include="Emu\Cell\lv2\sys_rsxaudio.h" />
+    <ClInclude Include="Emu\Cell\lv1\lv1.h" />
+    <ClInclude Include="Emu\Cell\lv1\lv1_usb.h" />
+    <ClInclude Include="Emu\Cell\lv1\lv1_bdvd.h" />
     <ClInclude Include="Emu\Cell\lv2\sys_sm.h" />
     <ClInclude Include="Emu\Cell\lv2\sys_storage.h" />
     <ClInclude Include="Emu\Cell\lv2\sys_uart.h" />

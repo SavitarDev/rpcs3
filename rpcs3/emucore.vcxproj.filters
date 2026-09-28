@@ -49,6 +49,9 @@
     <Filter Include="Emu\Cell\lv2">
       <UniqueIdentifier>{269371f1-45b7-4ca9-a4a7-376e6e62a8ba}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Emu\Cell\lv1">
+      <UniqueIdentifier>{7db65c09-745f-453a-aa41-b47c7af860d3}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Emu\Cell\Modules">
       <UniqueIdentifier>{4317ac27-38e4-4f8d-9bac-496f9b00f615}</UniqueIdentifier>
     </Filter>
@@ -344,6 +347,18 @@
     </ClCompile>
     <ClCompile Include="Emu\Cell\lv2\sys_sm.cpp">
       <Filter>Emu\Cell\lv2</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv1\lv1.cpp">
+      <Filter>Emu\Cell\lv1</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv1\lv1_guest_os.cpp">
+      <Filter>Emu\Cell\lv1</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv1\lv1_usb.cpp">
+      <Filter>Emu\Cell\lv1</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\lv1\lv1_bdvd.cpp">
+      <Filter>Emu\Cell\lv1</Filter>
     </ClCompile>
     <ClCompile Include="Emu\Cell\lv2\sys_hid.cpp">
       <Filter>Emu\Cell\lv2</Filter>
@@ -1751,6 +1766,15 @@
     </ClInclude>
     <ClInclude Include="Emu\Cell\lv2\sys_sm.h">
       <Filter>Emu\Cell\lv2</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\Cell\lv1\lv1.h">
+      <Filter>Emu\Cell\lv1</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\Cell\lv1\lv1_usb.h">
+      <Filter>Emu\Cell\lv1</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\Cell\lv1\lv1_bdvd.h">
+      <Filter>Emu\Cell\lv1</Filter>
     </ClInclude>
     <ClInclude Include="Emu\Cell\lv2\sys_hid.h">
       <Filter>Emu\Cell\lv2</Filter>
